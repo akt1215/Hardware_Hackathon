@@ -7,8 +7,8 @@
 //
 // Serial protocol (115200 baud), one line per frame, terminated by '\n':
 //     roll,pitch,dist,temp,gesture
-//   roll    float  degrees  (-180..180)  board roll  -> orbit particles
-//   pitch   float  degrees  (-90..90)    board pitch -> orbit particles
+//   roll    float  degrees  (-180..180)  gyro-fused roll  -> orbit particles
+//   pitch   float  degrees  (-90..90)    gyro-fused pitch -> orbit particles
 //   dist    float  cm       (-1 if none) hand height -> expansion radius
 //   temp    float  degC                  -> particle hue
 //   gesture int    0 or 1                1 = shake detected this frame -> explode
@@ -30,7 +30,8 @@ static const uint8_t PIN_ECHO = D6;
 static const uint8_t PIN_SPK  = D9;
 
 // ---- tuning ----
-static const float EMA_ALPHA            = 0.30f;  // distance/angle smoothing
+static const float EMA_ALPHA            = 0.30f;  // distance smoothing
+static const float COMP_ALPHA           = 0.98f;  // gyro weight in the roll/pitch fusion
 static const float SHAKE_THRESH         = 8.0f;   // m/s^2 deviation from 1g = shake
 static const uint32_t SHAKE_COOLDOWN_MS = 350;    // min gap between explode triggers
 static const uint32_t LOOP_PERIOD_MS    = 20;     // ~50 Hz stream
@@ -45,6 +46,7 @@ bool haveMcp = false;
 float rollF = 0, pitchF = 0, distF = -1, tempF = 25;
 uint32_t lastShakeMs = 0;
 uint32_t lastLoopMs = 0;
+uint32_t lastFuseMs = 0;   // timestamp for gyro integration dt
 
 static float ema(float prev, float now) { return prev + EMA_ALPHA * (now - prev); }
 
@@ -111,16 +113,25 @@ void loop() {
 
   int gesture = 0;
 
-  // --- MPU-6050: orientation + shake ---
+  // --- MPU-6050: gyro-driven orientation (complementary filter) + shake ---
   if (haveMpu) {
     sensors_event_t a, g, t;
     mpu.getEvent(&a, &g, &t);
     float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
 
-    float roll  = atan2f(ay, az) * 57.2957795f;
-    float pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2957795f;
-    rollF  = ema(rollF, roll);
-    pitchF = ema(pitchF, pitch);
+    // gyro rates about X (roll) and Y (pitch), rad/s -> deg/s
+    float gxDeg = g.gyro.x * 57.2957795f;
+    float gyDeg = g.gyro.y * 57.2957795f;
+
+    // accelerometer gives absolute tilt (no drift, but noisy)
+    float accRoll  = atan2f(ay, az) * 57.2957795f;
+    float accPitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2957795f;
+
+    // integrate the gyro for snappy response; let the accel slowly correct drift.
+    float dt = (lastFuseMs == 0) ? 0.0f : (now - lastFuseMs) * 0.001f;
+    lastFuseMs = now;
+    rollF  = COMP_ALPHA * (rollF  + gxDeg * dt) + (1.0f - COMP_ALPHA) * accRoll;
+    pitchF = COMP_ALPHA * (pitchF + gyDeg * dt) + (1.0f - COMP_ALPHA) * accPitch;
 
     float mag = sqrtf(ax * ax + ay * ay + az * az);
     if (fabsf(mag - 9.81f) > SHAKE_THRESH && (now - lastShakeMs) > SHAKE_COOLDOWN_MS) {
