@@ -1,0 +1,69 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+// Create the MPU6050 object
+Adafruit_MPU6050 mpu;
+
+void setup(void) {
+  // Start the serial communication at 115200 baud rate
+  Serial.begin(115200);
+  
+  // Wait for serial monitor to open before proceeding
+  while (!Serial) {
+    delay(10); 
+  }
+
+  Serial.println("Starting MPU6050 Test...");
+
+  // Initialize the MPU6050 on the default I2C pins (SDA/SCL)
+  // Under the hood, this uses PB8 and PB9 on your Nucleo board
+  if (!mpu.begin()) {
+    Serial.println("ERROR: Failed to find MPU6050 chip!");
+    Serial.println("Check your wiring. Is the board powered? Are SDA/SCL correct?");
+    while (1) {
+      delay(10); // Halt execution if sensor is not found
+    }
+  }
+  Serial.println("MPU6050 Found and Initialized!");
+
+  // Set sensor ranges (optional, but good for calibration)
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  Serial.println("Setup complete.\n");
+  delay(100);
+}
+
+void loop() {
+  // Create variables to hold the sensor data
+  sensors_event_t a, g, temp;
+  
+  // Fetch the latest readings from the sensor
+  mpu.getEvent(&a, &g, &temp);
+
+  // --- Print Accelerometer Data ---
+  Serial.print("Accel (m/s^2) -> X: ");
+  Serial.print(a.acceleration.x, 2);
+  Serial.print(" | Y: ");
+  Serial.print(a.acceleration.y, 2);
+  Serial.print(" | Z: ");
+  Serial.println(a.acceleration.z, 2);
+
+  // --- Print Gyroscope Data ---
+  Serial.print("Gyro  (rad/s) -> X: ");
+  Serial.print(g.gyro.x, 2);
+  Serial.print(" | Y: ");
+  Serial.print(g.gyro.y, 2);
+  Serial.print(" | Z: ");
+  Serial.println(g.gyro.z, 2);
+
+  // --- Print Temperature Data ---
+  Serial.print("Temperature   -> ");
+  Serial.print(temp.temperature, 1);
+  Serial.println(" C\n");
+
+  // Wait half a second before reading again
+  delay(500);
+}
