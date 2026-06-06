@@ -363,10 +363,11 @@ function animate() {
 requestAnimationFrame(animate);
 
 // =====================================================================
-//  ZenAudio — generative lofi/zen soundscape (Web Audio, no samples).
-//  Ambient drone pad + tape wobble + soft vinyl crackle + a slow lofi pulse,
-//  reacting to controller activity. Every explosion rings a pentatonic bell,
-//  so any board (local or remote) "plays" the laptop in harmony.
+//  ZenAudio — generative lofi/zen track (Web Audio, no samples).
+//  Soft maj7/min7 chord progression + warm gliding sub-bass + a music-box
+//  pentatonic melody + a laid-back beat (kick / soft snare / hats) + tape
+//  wobble + vinyl crackle, all reacting to controller activity. Every
+//  explosion rings a pentatonic bell, so any board plays over it in harmony.
 // =====================================================================
 class ZenAudio {
   constructor() {
@@ -375,44 +376,79 @@ class ZenAudio {
 
     this.master = ctx.createGain(); this.master.gain.value = 0; this.master.connect(ctx.destination);
     this.muted = false;
-    this.scale = [440, 523.25, 587.33, 659.25, 783.99, 880]; // A major pentatonic (A4..A5)
-    this.cutBase = 680;
+    this.bell  = [440, 523.25, 587.33, 659.25, 783.99, 880];   // explosion bells (A pentatonic)
+    this.penta = [523.25, 587.33, 659.25, 783.99, 880.00];     // music-box melody (C pentatonic)
+    this.chords = [                                            // I – vi – ii – V in C, lofi 7ths
+      [261.63, 329.63, 392.00, 493.88],  // Cmaj7
+      [220.00, 261.63, 329.63, 392.00],  // Am7
+      [293.66, 349.23, 440.00, 523.25],  // Dm7
+      [196.00, 246.94, 293.66, 349.23],  // G7
+    ];
+    this.bassRoots = [130.81, 110.00, 146.83, 98.00];          // C3 A2 D3 G2
+    this.cutBase = 700;
 
-    // reverb (synthetic impulse) with wet/dry sends
-    this.reverb = ctx.createConvolver(); this.reverb.buffer = this._impulse(3.4, 2.4);
-    this.wet = ctx.createGain(); this.wet.gain.value = 0.55; this.reverb.connect(this.wet); this.wet.connect(this.master);
+    // reverb with wet/dry sends
+    this.reverb = ctx.createConvolver(); this.reverb.buffer = this._impulse(3.6, 2.3);
+    this.wet = ctx.createGain(); this.wet.gain.value = 0.5; this.reverb.connect(this.wet); this.wet.connect(this.master);
     this.dry = ctx.createGain(); this.dry.gain.value = 0.9; this.dry.connect(this.master);
 
-    // warm lowpass pad bus
+    // warm lowpass pad bus with slow breathing
     this.padFilter = ctx.createBiquadFilter();
     this.padFilter.type = 'lowpass'; this.padFilter.frequency.value = this.cutBase; this.padFilter.Q.value = 0.7;
-    this.padGain = ctx.createGain(); this.padGain.gain.value = 0.22;
+    this.padGain = ctx.createGain(); this.padGain.gain.value = 0.13;
     this.padFilter.connect(this.padGain); this.padGain.connect(this.dry); this.padGain.connect(this.reverb);
-
-    // calm open-chord drone, detuned + tape wobble for lofi warmth
-    [110, 164.81, 220].forEach((f, i) => {
-      const o = ctx.createOscillator(); o.type = i === 0 ? 'sine' : 'triangle'; o.frequency.value = f;
-      const g = ctx.createGain(); g.gain.value = i === 0 ? 0.5 : 0.28;
-      o.connect(g); g.connect(this.padFilter); o.start();
-      const lfo = ctx.createOscillator(); lfo.frequency.value = 0.10 + i * 0.035;
-      const lg = ctx.createGain(); lg.gain.value = 2.5; lfo.connect(lg); lg.connect(o.detune); lfo.start();
-    });
-
-    // slow "breathing" on the filter cutoff
     const breath = ctx.createOscillator(); breath.frequency.value = 0.06;
-    const bg = ctx.createGain(); bg.gain.value = 200;
-    breath.connect(bg); bg.connect(this.padFilter.frequency); breath.start();
+    const bg = ctx.createGain(); bg.gain.value = 220; breath.connect(bg); bg.connect(this.padFilter.frequency); breath.start();
 
-    // subtle vinyl crackle
+    // persistent chord-pad voices that glide between chords, with tape wobble
+    this.padOsc = [];
+    for (let k = 0; k < 4; k++) {
+      const o = ctx.createOscillator(); o.type = 'triangle'; o.frequency.value = this.chords[0][k];
+      const g = ctx.createGain(); g.gain.value = 0.25;
+      o.connect(g); g.connect(this.padFilter); o.start();
+      const lfo = ctx.createOscillator(); lfo.frequency.value = 0.08 + k * 0.03;
+      const lg = ctx.createGain(); lg.gain.value = 3; lfo.connect(lg); lg.connect(o.detune); lfo.start();
+      this.padOsc.push(o);
+    }
+
+    // warm sub-bass that glides to each chord root
+    this.bassOsc = ctx.createOscillator(); this.bassOsc.type = 'sine'; this.bassOsc.frequency.value = this.bassRoots[0];
+    const bf = ctx.createBiquadFilter(); bf.type = 'lowpass'; bf.frequency.value = 220;
+    this.bassGain = ctx.createGain(); this.bassGain.gain.value = 0.22;
+    this.bassOsc.connect(bf); bf.connect(this.bassGain); this.bassGain.connect(this.dry); this.bassOsc.start();
+
+    // vinyl crackle + continuous shimmer voice (driven by activity)
     this._noise(0.012, 3200);
-
-    // continuous shimmer voice driven by charge/activity
     this.shimmer = ctx.createOscillator(); this.shimmer.type = 'sine'; this.shimmer.frequency.value = 760;
     this.shimGain = ctx.createGain(); this.shimGain.gain.value = 0;
     this.shimmer.connect(this.shimGain); this.shimGain.connect(this.reverb); this.shimmer.start();
 
-    // gentle lofi pulse (~70 bpm)
-    this.beatTimer = setInterval(() => this._kick(), 850);
+    // transport: lookahead step sequencer — ~72 bpm, 8 steps/bar, 4-bar loop
+    this.bpm = 72; this.stepDur = (60 / this.bpm) / 2; this.step = 0;
+    this.nextStep = ctx.currentTime + 0.15;
+    this.sched = setInterval(() => this._scheduler(), 25);
+  }
+
+  _scheduler() {
+    while (this.nextStep < this.ctx.currentTime + 0.12) {
+      this._playStep(this.step, this.nextStep);
+      this.nextStep += this.stepDur;
+      this.step = (this.step + 1) % 32;     // 4 bars x 8 eighth-notes
+    }
+  }
+  _playStep(step, t) {
+    if (this.muted) return;
+    const inBar = step % 8, bar = (step / 8) | 0;
+    if (inBar === 0) this._setChord(bar % 4, t);          // chord per bar
+    if (inBar === 0 || inBar === 6) this._kick(t);        // laid-back kick
+    if (inBar === 4) this._snare(t);                      // soft backbeat
+    this._hat(t, inBar % 2 === 0 ? 0.08 : 0.04);          // swung hats
+    if ((inBar === 2 || inBar === 5 || inBar === 7) && Math.random() < 0.5)
+      this._pluck(this.penta[(Math.random() * this.penta.length) | 0], t);
+  }
+  _setChord(i, t) {
+    this.chords[i].forEach((f, k) => this.padOsc[k].frequency.setTargetAtTime(f, t, 0.25));
+    this.bassOsc.frequency.setTargetAtTime(this.bassRoots[i], t, 0.2);
   }
 
   _impulse(dur, decay) {
@@ -430,14 +466,39 @@ class ZenAudio {
     const g = ctx.createGain(); g.gain.value = gainVal;
     src.connect(hp); hp.connect(g); g.connect(this.dry); src.start();
   }
-  _kick() {
-    if (this.muted) return;
-    const ctx = this.ctx, t = ctx.currentTime;
+  _kick(t) {
+    const ctx = this.ctx;
     const o = ctx.createOscillator(), g = ctx.createGain();
     o.frequency.setValueAtTime(120, t); o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
-    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.16, t + 0.005);
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.18, t + 0.005);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
     o.connect(g); g.connect(this.dry); o.start(t); o.stop(t + 0.3);
+  }
+  _hat(t, amp) {
+    const ctx = this.ctx, len = (ctx.sampleRate * 0.05) | 0, buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0); for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    const s = ctx.createBufferSource(); s.buffer = buf;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7000;
+    const g = ctx.createGain(); g.gain.setValueAtTime(amp, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    s.connect(hp); hp.connect(g); g.connect(this.dry); s.start(t); s.stop(t + 0.06);
+  }
+  _snare(t) {
+    const ctx = this.ctx, len = (ctx.sampleRate * 0.2) | 0, buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0); for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    const s = ctx.createBufferSource(); s.buffer = buf;
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 0.6;
+    const g = ctx.createGain(); g.gain.setValueAtTime(0.07, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+    s.connect(bp); bp.connect(g); g.connect(this.dry); g.connect(this.reverb); s.start(t); s.stop(t + 0.2);
+  }
+  _pluck(f, t) {
+    const ctx = this.ctx;
+    [[1, 0.16], [2, 0.05]].forEach(([r, amp]) => {
+      const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = f * r;
+      const g = ctx.createGain(); g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(amp, t + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+      o.connect(g); g.connect(this.dry); g.connect(this.reverb); o.start(t); o.stop(t + 0.65);
+    });
   }
 
   start() {
@@ -468,8 +529,8 @@ class ZenAudio {
     if (this.muted) return;
     const ctx = this.ctx, t = ctx.currentTime;
     const warm = clamp((temp - 18) / 14, 0, 1);
-    const idx = clamp(Math.floor(warm * (this.scale.length - 1) + (Math.random() * 2 - 1)), 0, this.scale.length - 1);
-    const base = this.scale[idx];
+    const idx = clamp(Math.floor(warm * (this.bell.length - 1) + (Math.random() * 2 - 1)), 0, this.bell.length - 1);
+    const base = this.bell[idx];
     [[1, 0.5], [2.0, 0.24], [2.76, 0.13], [5.4, 0.05]].forEach(([ratio, amp]) => {
       const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = base * ratio;
       const g = ctx.createGain(); g.gain.value = 0;

@@ -62,12 +62,13 @@ zero console errors.
 
 ## Zen / lofi audio — added
 "The world is your controller" now also plays it.
-- `web/hand-particle-sphere.html` — `ZenAudio`: a generative Web Audio soundscape (no
-  samples, works offline). Ambient detuned drone + tape wobble + soft vinyl crackle + a
-  gentle ~70 bpm lofi pulse, all reacting to controller activity (charge brightens the pad
-  and a shimmer voice; tilt shifts it). Every explosion — from ANY board, local or remote —
-  rings a C-major-pentatonic bell, so the room plays the laptop in harmony. "Zen" button
-  toggles it (audio needs a user gesture to start).
+- `web/hand-particle-sphere.html` — `ZenAudio`: a generative lofi/zen *track* (no samples,
+  works offline). A maj7/min7 chord progression (Cmaj7–Am7–Dm7–G7) on gliding pads, a warm
+  sub-bass following the chord root, a music-box pentatonic melody, and a laid-back beat
+  (kick / soft snare / swung hats) driven by a lookahead step sequencer (~72 bpm), plus tape
+  wobble + vinyl crackle. All reacts to controller activity (charge brightens the pad and a
+  shimmer voice; tilt shifts it). Every explosion — from ANY board, local or remote — rings
+  a pentatonic bell over the track. "Zen" button toggles it (audio needs a user gesture).
 - `src/main.cpp` — the STEMMA speaker now plays zen tones too: a calm ascending pentatonic
   arpeggio on boot and a soft pentatonic bell on each shake (replacing the old beep/whoosh).
   Builds clean: `pio run` → SUCCESS (Flash 9.3%).
