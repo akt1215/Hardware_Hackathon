@@ -1,24 +1,45 @@
-# Air Theremin — Firmware Spec & Plan
+# Particle Storm — Firmware Spec & Plan
 
 **Hackathon:** NYTECHWEEK Hardware Hack — theme "The World is Your Controller"
 **Board:** STM32 Nucleo-G474RE (Cortex-M4 @ 170MHz), Arduino framework via PlatformIO
-**One-line:** A hand-played instrument — wave your hand over the ultrasonic sensor for
-pitch, tilt the board to bend/vibrato, and the temperature sensor picks the musical scale.
+**One-line:** The board is a **physical motion remote**. It streams tilt/shake/hand-distance/
+temperature over USB serial; a browser app reads it via the **Web Serial API** and drives a
+3D storm of 3000 particles that orbit, gather, spread, and explode in real time.
+
+Inspired by the "Particle Storm" reel — but instead of a webcam tracking a hand, **the hardware
+is the controller.**
 
 ---
 
-## Concept
+## Architecture
 
-| Component | Role | Maps to |
-|-----------|------|---------|
-| HC-SR04 ultrasonic | hand-height input | **pitch** (note in scale) |
-| MPU-6050 IMU | board tilt (roll) input | **pitch bend / vibrato** |
-| MCP9808 temp | ambient/touch input | **scale select** (cool = minor, warm = major) |
-| STEMMA speaker | audio output | the live tone |
-| Onboard LED (PA5) | visual output | **VU / pitch brightness** |
+```
+STM32 Nucleo-G474RE                 USB (ST-Link Virtual COM)        Chrome browser
+  MPU-6050  tilt/shake   ──┐                                      ┌─ Web Serial reads stream
+  HC-SR04   hand dist     ─┼─► Serial CSV @115200, ~50Hz ───────► ┤  Three.js, 3000 particles
+  MCP9808   temp         ──┤   "roll,pitch,dist,temp,gesture\n"   └─ orbit/gather/spread/explode
+  Speaker   whoosh ◄──────┘
+```
 
-Key trick: **quantize pitch to a pentatonic scale** so any hand movement sounds musical,
-not like noise. This is what makes the demo sound intentional.
+No extra bridge hardware: the Nucleo's ST-Link already exposes a USB Virtual COM Port, and
+STM32duino's `Serial` (USART2) routes to it. The browser reads that COM port directly.
+
+---
+
+## Serial Protocol (115200 baud, one line per frame, `\n`-terminated)
+
+```
+roll,pitch,dist,temp,gesture
+```
+| Field | Type | Units | Meaning → particle effect |
+|-------|------|-------|---------------------------|
+| roll | float | deg (-180..180) | board roll → orbit/spin |
+| pitch | float | deg (-90..90) | board pitch → orbit tilt |
+| dist | float | cm (-1 = none) | hand height → expansion radius (close=gather, far=spread) |
+| temp | float | °C | particle hue (cool→warm) |
+| gesture | int | 0/1 | 1 = shake detected this frame → explode |
+
+Lines starting with `#` are log/comment lines and are ignored by the web app.
 
 ---
 
@@ -26,67 +47,62 @@ not like noise. This is what makes the demo sound intentional.
 
 | Signal | Pin | Notes |
 |--------|-----|-------|
-| I²C SDA | D14 (PB9) | shared bus |
-| I²C SCL | D15 (PB8) | shared bus |
-| MPU-6050 | I²C @ 0x68 | 3.3V power |
-| MCP9808 | I²C @ 0x18 | 3.3V power |
+| I²C SDA | D14 (PB9) | MPU-6050 @0x68, MCP9808 @0x18 (shared bus) |
+| I²C SCL | D15 (PB8) | |
 | HC-SR04 TRIG | D7 (PA8) | output pulse |
-| HC-SR04 ECHO | D6 (PB10) | **5V — use 1kΩ/2kΩ divider into pin**; sensor VCC = 5V |
-| Speaker signal | D9 (PC7) | PWM/timer pin for `tone()`; A+ on STEMMA, A- to GND, VIN = 5V |
-| Status/VU LED | LED_BUILTIN (PA5) | `analogWrite` for brightness |
-
----
-
-## Behavior Spec
-
-- **Pitch (HC-SR04):** usable range ~4–40 cm. Map distance → index into the active scale
-  (e.g. C pentatonic across ~2 octaves). Out-of-range (>50 cm or 0) = silence (note-off).
-- **Pitch bend / vibrato (MPU-6050):** roll angle ±~30° → bend pitch ± up to ~2 semitones,
-  or add vibrato (small periodic frequency wobble). A sharp tap (accel spike) = re-trigger note.
-- **Scale select (MCP9808):** below ~24 °C → minor pentatonic; at/above → major pentatonic.
-  Warming the sensor with your hand audibly changes the mood — a memorable live moment.
-- **LED (PA5):** brightness tracks current note height (higher pitch = brighter); off when silent.
-- **Smoothing:** EMA on distance (α ≈ 0.3) to kill jitter; sample loop ~30 Hz.
-- **Serial @ 115200:** print `dist_cm`, `roll_deg`, `temp_c`, `note`, `freq_hz` for live tuning/debug.
-
-### Volume note (be realistic)
-Arduino `tone()` is fixed-amplitude, so true volume control isn't free. **MVP:** tilt controls
-pitch-bend/vibrato (not loudness). **Stretch:** use the G4 **DAC (PA4)** to synthesize a sine and
-scale its amplitude for real tilt-controlled volume.
+| HC-SR04 ECHO | D6 (PB10) | **5V — 1kΩ/2kΩ divider into pin**; sensor VCC = 5V |
+| Speaker signal | D9 (PC7) | `tone()`; A+ on STEMMA, A- to GND, VIN = 5V |
+| Status LED | LED_BUILTIN (PA5) | on while a hand is detected |
+| Serial out | USART2 → ST-Link VCP | `Serial` at 115200 (this IS the remote channel) |
 
 ---
 
 ## Build Order (always-demoable layers)
 
-- [ ] **L0 — Sanity:** flash blink + serial heartbeat, confirm board + ST-Link upload work
-- [ ] **L1 — MPU-6050:** read accel/gyro over I²C, compute roll angle, print to serial
-- [ ] **L2 — HC-SR04:** trigger/echo distance read (with divider), EMA smoothing, print cm
-- [ ] **L3 — Audio MVP:** map distance → pentatonic note → `tone()` on speaker  ← **playable instrument**
-- [ ] **L4 — Expression:** tilt → pitch bend/vibrato; LED brightness tracks pitch
-- [ ] **L5 — Scale select:** MCP9808 temp → minor/major pentatonic switch
-- [ ] **L6 — Polish:** tune ranges, note-off behavior, smoothing, rehearse the demo
+- [ ] **L0 — Sanity:** flash, confirm board enumerates as a COM port, serial prints at 115200
+- [ ] **L1 — MPU-6050:** roll/pitch from accel + shake detection (accel-magnitude spike, cooldown)
+- [ ] **L2 — HC-SR04:** distance with divider, EMA smoothing, -1 when out of range
+- [ ] **L3 — Stream:** emit `roll,pitch,dist,temp,gesture` CSV at ~50 Hz  ← **web app can drive now**
+- [ ] **L4 — MCP9808:** add temperature field (hue)
+- [ ] **L5 — Speaker:** whoosh on shake/explode, ready-beep on boot
+- [ ] **L6 — Web app:** Three.js particle storm reads the stream via Web Serial (see `web/index.html`)
+- [ ] **L7 — Polish:** tune shake threshold, distance range, smoothing; rehearse demo
 
-MVP (a working, playable instrument) is complete at **L3**.
+Web app already scaffolded in `web/index.html` with a **demo mode** (mouse = tilt, mouse-Y =
+distance, SPACE = explode) so the visuals can be tuned before the board is wired.
+
+---
+
+## Running the Web App (Web Serial needs a secure context)
+
+```
+cd web
+python -m http.server 8000
+```
+Open **http://localhost:8000** in **Chrome or Edge** → click **Connect Board** → pick the
+STM32 COM port. (Web Serial requires localhost/https + Chromium; it will not work from file://.)
 
 ---
 
 ## Acceptance Criteria (verify before "done")
 
-- [ ] Board flashes via `pio run -t upload`; serial shows live sensor values at 115200
-- [ ] Moving a hand 4→40 cm sweeps audible pitch across the scale, quantized (no random pitches)
-- [ ] Tilting the board audibly bends/vibratos the current note
-- [ ] Warming the MCP9808 switches the scale (mood change is clearly audible)
-- [ ] LED brightness visibly tracks pitch; LED off + speaker silent when hand is out of range
-- [ ] No I²C hang if a sensor is unplugged (init failure logged, loop continues)
-- [ ] Clean build: `pio run` succeeds with no errors
+- [ ] `pio run` builds clean; `pio run -t upload` flashes the board
+- [ ] Board appears as a serial/COM port; `pio device monitor` shows CSV frames at ~50 Hz
+- [ ] Tilting the board orbits the particle sphere in the browser
+- [ ] Moving a hand 4→40 cm over the HC-SR04 visibly gathers / spreads the particles
+- [ ] A sharp shake explodes the particles outward (+ speaker whoosh)
+- [ ] Warming the MCP9808 shifts particle hue
+- [ ] Graceful sensor-init failure (logs `# ... init failed`, loop keeps streaming)
+- [ ] Web app connects via Web Serial, parses the stream, and ignores `#` log lines
 
 ---
 
-## Stretch Goals (if time)
+## Stretch Goals
 
-- [ ] DAC sine output (PA4) with real tilt-controlled volume
-- [ ] Second LED or onboard LED blink as a tempo/beat indicator
-- [ ] "Record & loop" a short phrase, play it back layered under live notes
+- [ ] Gyro fusion for snappier tilt response
+- [ ] Distinct gestures (flick vs shake) → different effects (vortex, implode)
+- [ ] Bloom post-processing on the particles for extra glow
+- [ ] On-screen "morph to a word/shape" mode triggered by a held tilt
 
 ---
 

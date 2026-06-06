@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Particle Storm</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #05040a; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { position: fixed; inset: 0; }
+  .ui { position: fixed; z-index: 10; color: #fff; }
+  #title { top: 22px; left: 26px; font-weight: 700; letter-spacing: .14em; font-size: 14px; text-transform: uppercase; opacity: .85; }
+  #title small { display:block; font-weight:400; letter-spacing:.05em; text-transform:none; opacity:.55; margin-top:4px; }
+  #panel { top: 20px; right: 22px; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+  button { font: inherit; font-size: 13px; font-weight: 600; color: #fff; background: rgba(255,255,255,.08);
+    border: 1px solid rgba(255,255,255,.22); padding: 9px 16px; border-radius: 999px; cursor: pointer;
+    backdrop-filter: blur(6px); transition: background .15s, border-color .15s; }
+  button:hover { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.45); }
+  button:disabled { opacity: .4; cursor: default; }
+  #status { font-size: 12px; opacity: .7; }
+  #status .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#777; margin-right:6px; vertical-align:middle; }
+  #status.live .dot { background:#36e08a; box-shadow:0 0 8px #36e08a; }
+  #readout { bottom: 18px; left: 26px; font-size: 12px; line-height: 1.7; opacity: .55; font-variant-numeric: tabular-nums; }
+  #hint { bottom: 18px; right: 22px; font-size: 11px; opacity: .4; text-align: right; max-width: 280px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="title" class="ui">Particle Storm<small>the world is your controller</small></div>
+<div id="panel" class="ui">
+  <button id="connect">Connect Board</button>
+  <div id="status"><span class="dot"></span><span id="statusText">demo mode</span></div>
+</div>
+<div id="readout" class="ui">roll 0.0  pitch 0.0  dist —  temp 25.0</div>
+<div id="hint" class="ui">Demo: move mouse = tilt · mouse Y = hand distance · press SPACE = explode</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------------- scene ----------------
+const app = document.getElementById('app');
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x05040a, 0.012);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+camera.position.set(0, 0, 70);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+app.appendChild(renderer.domElement);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------------- particles ----------------
+const N = 3000;
+const group = new THREE.Group();
+scene.add(group);
+
+const baseDir = new Float32Array(N * 3);   // unit direction on sphere
+const pos     = new Float32Array(N * 3);   // current position
+const vel     = new Float32Array(N * 3);   // velocity
+const colors  = new Float32Array(N * 3);
+
+// fibonacci sphere for even distribution
+for (let i = 0; i < N; i++) {
+  const y = 1 - (i / (N - 1)) * 2;
+  const r = Math.sqrt(1 - y * y);
+  const phi = i * Math.PI * (3 - Math.sqrt(5));
+  const dx = Math.cos(phi) * r, dy = y, dz = Math.sin(phi) * r;
+  baseDir[i*3] = dx; baseDir[i*3+1] = dy; baseDir[i*3+2] = dz;
+  pos[i*3] = dx * 18; pos[i*3+1] = dy * 18; pos[i*3+2] = dz * 18;
+}
+
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+// soft round sprite so points glow instead of being squares
+function discTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.3, 'rgba(255,255,255,0.8)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+const mat = new THREE.PointsMaterial({
+  size: 0.9, map: discTexture(), vertexColors: true, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+const points = new THREE.Points(geo, mat);
+group.add(points);
+
+// ---------------- control state ----------------
+const ctrl = { roll: 0, pitch: 0, dist: -1, temp: 25, explode: false };
+let spin = 0;
+let rollTarget = 0, pitchTarget = 0, radius = 18;
+
+function triggerExplode() {
+  for (let i = 0; i < N; i++) {
+    const k = (12 + Math.random() * 8);
+    vel[i*3]   += baseDir[i*3]   * k + (Math.random()-0.5) * 4;
+    vel[i*3+1] += baseDir[i*3+1] * k + (Math.random()-0.5) * 4;
+    vel[i*3+2] += baseDir[i*3+2] * k + (Math.random()-0.5) * 4;
+  }
+}
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// hue from temperature: cool(blue ~0.62) -> warm(magenta/red ~0.95)
+function hueFromTemp(t) { return clamp((t - 18) / (32 - 18), 0, 1) * 0.5 + 0.55; }
+
+const col = new THREE.Color();
+
+function update(dt) {
+  // distance -> radius: hand close = gather, far = spread; no hand -> idle 18
+  if (ctrl.dist >= 0) radius += ((clamp(ctrl.dist, 4, 40) - 4) / 36 * 26 + 8 - radius) * 0.08;
+  else radius += (18 - radius) * 0.03;
+
+  // tilt -> rotation
+  rollTarget  += (ctrl.roll  * Math.PI/180 * 1.1 - rollTarget)  * 0.08;
+  pitchTarget += (ctrl.pitch * Math.PI/180 * 1.1 - pitchTarget) * 0.08;
+  spin += 0.002;
+  group.rotation.y = spin + rollTarget;
+  group.rotation.x += (pitchTarget - group.rotation.x) * 0.1;
+
+  if (ctrl.explode) { triggerExplode(); ctrl.explode = false; }
+
+  const hue = hueFromTemp(ctrl.temp);
+  const k = 0.06, damp = 0.9;
+  for (let i = 0; i < N; i++) {
+    const ix = i*3, iy = i*3+1, iz = i*3+2;
+    // spring toward target shell position
+    const tx = baseDir[ix]*radius, ty = baseDir[iy]*radius, tz = baseDir[iz]*radius;
+    vel[ix] += (tx - pos[ix]) * k; vel[iy] += (ty - pos[iy]) * k; vel[iz] += (tz - pos[iz]) * k;
+    vel[ix] *= damp; vel[iy] *= damp; vel[iz] *= damp;
+    pos[ix] += vel[ix]; pos[iy] += vel[iy]; pos[iz] += vel[iz];
+
+    // brighten particles that are flung out (speed-based)
+    const sp = Math.min(1, (vel[ix]*vel[ix]+vel[iy]*vel[iy]+vel[iz]*vel[iz]) * 0.02);
+    col.setHSL((hue + i / N * 0.08) % 1, 0.85, 0.45 + sp * 0.4);
+    colors[ix] = col.r; colors[iy] = col.g; colors[iz] = col.b;
+  }
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.color.needsUpdate = true;
+
+  document.getElementById('readout').textContent =
+    `roll ${ctrl.roll.toFixed(1)}  pitch ${ctrl.pitch.toFixed(1)}  ` +
+    `dist ${ctrl.dist < 0 ? '—' : ctrl.dist.toFixed(1)}  temp ${ctrl.temp.toFixed(1)}`;
+}
+
+let last = performance.now();
+function animate(now) {
+  const dt = (now - last) / 16.67; last = now;
+  update(dt);
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// ---------------- demo controls (no board needed) ----------------
+addEventListener('mousemove', (e) => {
+  if (statusEl.classList.contains('live')) return;   // hardware overrides demo
+  ctrl.roll  = (e.clientX / innerWidth  - 0.5) * 90;
+  ctrl.pitch = (e.clientY / innerHeight - 0.5) * 90;
+  ctrl.dist  = 4 + (e.clientY / innerHeight) * 36;
+});
+addEventListener('keydown', (e) => { if (e.code === 'Space') { e.preventDefault(); ctrl.explode = true; } });
+
+// ---------------- Web Serial bridge ----------------
+const statusEl = document.getElementById('status');
+const statusText = document.getElementById('statusText');
+const connectBtn = document.getElementById('connect');
+
+function setStatus(live, text) {
+  statusEl.classList.toggle('live', live);
+  statusText.textContent = text;
+}
+
+if (!('serial' in navigator)) {
+  connectBtn.disabled = true;
+  setStatus(false, 'Web Serial needs Chrome/Edge');
+}
+
+connectBtn.addEventListener('click', async () => {
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    setStatus(true, 'board connected');
+    connectBtn.disabled = true;
+    document.getElementById('hint').textContent = 'Tilt = orbit · hand over sensor = gather/spread · shake = explode';
+    readLoop(port);
+  } catch (err) {
+    setStatus(false, 'connect cancelled');
+  }
+});
+
+async function readLoop(port) {
+  const decoder = new TextDecoderStream();
+  port.readable.pipeTo(decoder.writable).catch(() => {});
+  const reader = decoder.readable.getReader();
+  let buf = '';
+  while (true) {
+    let res;
+    try { res = await reader.read(); } catch { break; }
+    if (res.done) break;
+    buf += res.value;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line || line[0] === '#') continue;       // skip comments/log lines
+      const p = line.split(',');
+      if (p.length < 5) continue;
+      const roll = +p[0], pitch = +p[1], dist = +p[2], temp = +p[3], g = +p[4];
+      if (Number.isFinite(roll))  ctrl.roll  = roll;
+      if (Number.isFinite(pitch)) ctrl.pitch = pitch;
+      if (Number.isFinite(dist))  ctrl.dist  = dist;
+      if (Number.isFinite(temp))  ctrl.temp  = temp;
+      if (g === 1) ctrl.explode = true;
+    }
+  }
+  setStatus(false, 'board disconnected');
+  connectBtn.disabled = false;
+}
+</script>
+</body>
+</html>
