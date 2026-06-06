@@ -1,0 +1,15 @@
+{
+  "name": "particle-storm-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "LAN relay (HTTPS + WebSocket) so remote sensor boards can join one shared Particle Storm screen.",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  }
+}

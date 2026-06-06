@@ -62,7 +62,18 @@ static float readDistanceCm() {
   return cm;
 }
 
-static void chirp(int freq, int ms) { tone(PIN_SPK, freq, ms); }
+// C major pentatonic (C5 D5 E5 G5 A5) — always-consonant "zen" notes.
+static const int ZEN[5] = { 523, 587, 659, 784, 880 };
+
+// A soft pentatonic bell on the STEMMA speaker — calming, never dissonant.
+static void zenBell() { tone(PIN_SPK, ZEN[random(0, 5)], 220); }
+
+// Calm ascending arpeggio (blocking — only used at boot).
+static void zenBoot() {
+  tone(PIN_SPK, ZEN[0], 160); delay(180);
+  tone(PIN_SPK, ZEN[2], 160); delay(180);
+  tone(PIN_SPK, ZEN[3], 260); delay(160);
+}
 
 void setup() {
   Serial.begin(115200);
@@ -90,7 +101,7 @@ void setup() {
     Serial.println("# MCP9808 init failed");
   }
 
-  chirp(660, 120);          // ready beep
+  zenBoot();                // calm ascending pentatonic motif on boot
 }
 
 void loop() {
@@ -115,7 +126,7 @@ void loop() {
     if (fabsf(mag - 9.81f) > SHAKE_THRESH && (now - lastShakeMs) > SHAKE_COOLDOWN_MS) {
       gesture = 1;
       lastShakeMs = now;
-      chirp(180, 140);      // explode whoosh
+      zenBell();            // soft pentatonic bell on shake/explode
     }
   }
 

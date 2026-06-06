@@ -9,14 +9,13 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; background: #05040a; overflow: hidden;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
-  #stage { position: fixed; inset: 0; }
 
   /* webcam feed sits behind the particle canvas, mirrored like a selfie */
   #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover;
     transform: scaleX(-1); opacity: 0; transition: opacity .6s; background: #05040a; }
   #cam.on { opacity: 1; }
 
-  /* particles render on a transparent-ish canvas; screen blend = black shows the video,
+  /* particles render on a canvas; screen blend = black shows the video,
      bright particles glow over it */
   #gl { position: fixed; inset: 0; width: 100%; height: 100%; mix-blend-mode: screen; }
 
@@ -53,6 +52,17 @@
 
   #readout { bottom: 18px; right: 22px; font-size: 11px; line-height: 1.7; opacity: .5;
     font-variant-numeric: tabular-nums; text-align: right; text-shadow: 0 1px 10px rgba(0,0,0,.8); }
+
+  /* join QR, bottom-right corner */
+  #join { bottom: 64px; right: 22px; display: none; flex-direction: column; align-items: center;
+    gap: 8px; background: rgba(10,8,18,.55); border: 1px solid rgba(255,255,255,.16);
+    padding: 12px; border-radius: 14px; backdrop-filter: blur(8px); }
+  #join img { display: block; width: 116px; height: 116px; border-radius: 6px; background: #fff; }
+  #join .cap { font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    opacity: .8; text-align: center; }
+  #join .cap b { color: #8be9ff; }
+  #join .who { font-size: 10px; opacity: .55; }
+
   #toast { top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 13px; opacity: 0;
     background: rgba(10,8,16,.7); border: 1px solid rgba(255,255,255,.15);
     padding: 12px 18px; border-radius: 12px; backdrop-filter: blur(8px);
@@ -69,6 +79,7 @@
 <div id="panel" class="ui">
   <button id="camBtn">Camera</button>
   <button id="serialBtn">Serial</button>
+  <button id="soundBtn">Zen</button>
   <button id="resetBtn">Reset</button>
 </div>
 <div id="status" class="ui"><span class="dot"></span><span id="statusText">demo mode</span></div>
@@ -80,6 +91,13 @@
   <b>Two hands</b><span>pinch to scale</span>
 </div>
 <div id="readout" class="ui">roll 0.0&nbsp; pitch 0.0&nbsp; dist —&nbsp; temp 25.0</div>
+
+<div id="join" class="ui">
+  <img id="qr" alt="join QR" />
+  <div class="cap">scan to join &nbsp;·&nbsp; <b id="playerCount">0</b> live</div>
+  <div class="who">bring your own board</div>
+</div>
+
 <div id="toast" class="ui"></div>
 
 <script type="importmap">
@@ -88,58 +106,23 @@
 <script type="module">
 import * as THREE from 'three';
 
-// =====================================================================
-//  Shared control state — both the camera and the board write into this,
-//  so the particle engine is identical regardless of which controller drives.
-// =====================================================================
-const ctrl = {
-  posX: 0, posY: 0,     // sphere target position on screen, -1..1 (camera only)
-  yaw: 0, pitch: 0,     // accumulated rotation (radians)
-  scale: 1,             // sphere scale multiplier
-  charge: 0,            // 0..1 gather/brighten
-  explode: false,       // one-shot burst
-  temp: 25,             // °C -> hue
-  roll: 0, dist: -1,    // raw values for the readout
-};
-let source = 'demo';    // 'demo' | 'camera' | 'serial'
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+let audio = null;   // ZenAudio engine (created on first "Zen" click)
 
 // =====================================================================
-//  Three.js scene + particles
+//  Renderer + trail feedback (shared across all storms)
 // =====================================================================
 const canvas = document.getElementById('gl');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
-renderer.autoClearColor = true;
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.FogExp2(0x05040a, 0.010);
+scene.fog = new THREE.FogExp2(0x05040a, 0.008);
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
 camera.position.set(0, 0, 70);
 
-const N = 3000;
-const group = new THREE.Group();
-scene.add(group);
-
-const baseDir = new Float32Array(N * 3);   // unit direction on the sphere
-const pos     = new Float32Array(N * 3);   // current position
-const vel     = new Float32Array(N * 3);   // velocity
-const colors  = new Float32Array(N * 3);
-
-// fibonacci sphere — even point distribution
-for (let i = 0; i < N; i++) {
-  const y = 1 - (i / (N - 1)) * 2;
-  const r = Math.sqrt(1 - y * y);
-  const phi = i * Math.PI * (3 - Math.sqrt(5));
-  const dx = Math.cos(phi) * r, dy = y, dz = Math.sin(phi) * r;
-  baseDir[i*3] = dx; baseDir[i*3+1] = dy; baseDir[i*3+2] = dz;
-  pos[i*3] = dx * 18; pos[i*3+1] = dy * 18; pos[i*3+2] = dz * 18;
-}
-
-const geo = new THREE.BufferGeometry();
-geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
+// soft round sprite so points glow instead of being squares
 function discTexture() {
   const c = document.createElement('canvas'); c.width = c.height = 64;
   const g = c.getContext('2d');
@@ -150,24 +133,19 @@ function discTexture() {
   g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
   return new THREE.CanvasTexture(c);
 }
-const mat = new THREE.PointsMaterial({
+const sharedMat = new THREE.PointsMaterial({
   size: 0.95, map: discTexture(), vertexColors: true, transparent: true,
   blending: THREE.AdditiveBlending, depthWrite: false,
 });
-group.add(new THREE.Points(geo, mat));
 
-// ---------------------------------------------------------------------
-//  Render-target feedback for glowing explosion trails (the light streaks)
-//  Each frame: fade the previous buffer, add fresh particles, show it.
-// ---------------------------------------------------------------------
-const COPY = {
+// ---- render-target feedback for glowing explosion trails ----
+const copyMat = new THREE.ShaderMaterial({
   uniforms: { tDiffuse: { value: null }, fade: { value: 1.0 } },
   vertexShader: `varying vec2 vUv; void main(){ vUv = uv;
     gl_Position = vec4(position.xy, 0.0, 1.0); }`,
   fragmentShader: `uniform sampler2D tDiffuse; uniform float fade; varying vec2 vUv;
     void main(){ gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb * fade, 1.0); }`,
-};
-const copyMat = new THREE.ShaderMaterial(COPY);
+});
 const fsScene = new THREE.Scene();
 const fsCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 fsScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat));
@@ -180,7 +158,7 @@ function makeRT() {
   });
 }
 let rtA = makeRT(), rtB = makeRT();
-const TRAIL_FADE = 0.90;   // higher = longer streaks
+const TRAIL_FADE = 0.90;
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
@@ -189,112 +167,321 @@ addEventListener('resize', () => {
   rtA.setSize(s.x, s.y); rtB.setSize(s.x, s.y);
 });
 
-// =====================================================================
-//  Particle dynamics
-// =====================================================================
-let radius = 18, spin = 0, yawS = 0, pitchS = 0, scaleS = 1, posXS = 0, posYS = 0;
-const col = new THREE.Color();
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const hueFromTemp = (t) => clamp((t - 18) / 14, 0, 1) * 0.12 + 0.55; // cyan-blue -> indigo
 
-function triggerExplode() {
-  for (let i = 0; i < N; i++) {
-    const k = 13 + Math.random() * 9;
-    vel[i*3]   += baseDir[i*3]   * k + (Math.random()-0.5) * 5;
-    vel[i*3+1] += baseDir[i*3+1] * k + (Math.random()-0.5) * 5;
-    vel[i*3+2] += baseDir[i*3+2] * k + (Math.random()-0.5) * 5;
+// =====================================================================
+//  Storm — one particle sphere per controller (local host or remote player)
+// =====================================================================
+const _col = new THREE.Color();
+
+class Storm {
+  constructor(n, hueOffset = 0) {
+    this.n = n;
+    this.hueOffset = hueOffset;
+    this.baseDir = new Float32Array(n * 3);
+    this.pos     = new Float32Array(n * 3);
+    this.vel     = new Float32Array(n * 3);
+    this.colors  = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {                 // fibonacci sphere
+      const y = 1 - (i / (n - 1)) * 2;
+      const r = Math.sqrt(1 - y * y);
+      const phi = i * Math.PI * (3 - Math.sqrt(5));
+      const dx = Math.cos(phi) * r, dy = y, dz = Math.sin(phi) * r;
+      this.baseDir[i*3] = dx; this.baseDir[i*3+1] = dy; this.baseDir[i*3+2] = dz;
+      this.pos[i*3] = dx * 18; this.pos[i*3+1] = dy * 18; this.pos[i*3+2] = dz * 18;
+    }
+    this.geo = new THREE.BufferGeometry();
+    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+    this.geo.setAttribute('color', new THREE.BufferAttribute(this.colors, 3));
+    this.group = new THREE.Group();
+    this.group.add(new THREE.Points(this.geo, sharedMat));
+    scene.add(this.group);
+
+    this.ctrl = { posX: 0, posY: 0, yaw: 0, pitch: 0, scale: 1, charge: 0,
+                  explode: false, temp: 25, roll: 0, dist: -1 };
+    this.radius = 18; this.spin = 0;
+    this.yawS = 0; this.pitchS = 0; this.posXS = 0; this.posYS = 0; this.scaleS = 1;
+    this.targetX = 0; this.baseScale = 1; this.scaleNow = 1;
+  }
+
+  explode() {
+    for (let i = 0; i < this.n; i++) {
+      const k = 13 + Math.random() * 9;
+      this.vel[i*3]   += this.baseDir[i*3]   * k + (Math.random()-0.5) * 5;
+      this.vel[i*3+1] += this.baseDir[i*3+1] * k + (Math.random()-0.5) * 5;
+      this.vel[i*3+2] += this.baseDir[i*3+2] * k + (Math.random()-0.5) * 5;
+    }
+  }
+
+  reset() {
+    for (let i = 0; i < this.n; i++) {
+      this.pos[i*3]   = this.baseDir[i*3]*18;
+      this.pos[i*3+1] = this.baseDir[i*3+1]*18;
+      this.pos[i*3+2] = this.baseDir[i*3+2]*18;
+      this.vel[i*3] = this.vel[i*3+1] = this.vel[i*3+2] = 0;
+    }
+    const c = this.ctrl;
+    c.charge = 0; c.scale = 1; c.yaw = 0; c.pitch = 0; c.posX = 0; c.posY = 0;
+    this.spin = 0;
+  }
+
+  dispose() { scene.remove(this.group); this.geo.dispose(); }
+
+  update(idle) {
+    const c = this.ctrl;
+    const restR = (8 + c.scale * 16) * (1 - c.charge * 0.55);
+    this.radius += (restR - this.radius) * 0.10;
+
+    this.spin += idle ? 0.0007 : 0.0003;
+    this.yawS   += (c.yaw   - this.yawS)   * 0.045;
+    this.pitchS += (c.pitch - this.pitchS) * 0.045;
+    this.group.rotation.y = this.spin + this.yawS;
+    this.group.rotation.x = this.pitchS;
+
+    this.posXS += (c.posX * 26 - this.posXS) * 0.07;
+    this.posYS += (c.posY * 26 - this.posYS) * 0.07;
+    this.scaleNow += (this.baseScale - this.scaleNow) * 0.08;
+    this.group.scale.setScalar(this.scaleNow);
+    this.group.position.set(this.targetX + this.posXS, this.posYS, 0);
+
+    if (c.explode) { this.explode(); c.explode = false; if (audio) audio.chime(c.temp); }
+
+    const hue = (hueFromTemp(c.temp) + this.hueOffset + 1) % 1;
+    const k = 0.06 + c.charge * 0.05, damp = 0.90;
+    const pos = this.pos, vel = this.vel, baseDir = this.baseDir, colors = this.colors, R = this.radius;
+    for (let i = 0; i < this.n; i++) {
+      const ix = i*3, iy = i*3+1, iz = i*3+2;
+      const tx = baseDir[ix]*R, ty = baseDir[iy]*R, tz = baseDir[iz]*R;
+      vel[ix] += (tx - pos[ix]) * k; vel[iy] += (ty - pos[iy]) * k; vel[iz] += (tz - pos[iz]) * k;
+      vel[ix] *= damp; vel[iy] *= damp; vel[iz] *= damp;
+      pos[ix] += vel[ix]; pos[iy] += vel[iy]; pos[iz] += vel[iz];
+      const sp = Math.min(1, (vel[ix]*vel[ix]+vel[iy]*vel[iy]+vel[iz]*vel[iz]) * 0.02);
+      const light = 0.42 + sp * 0.45 + c.charge * 0.25;
+      const sat = 0.85 - c.charge * 0.5;
+      _col.setHSL((hue + i / this.n * 0.08) % 1, sat, Math.min(0.95, light));
+      colors[ix] = _col.r; colors[iy] = _col.g; colors[iz] = _col.b;
+    }
+    this.geo.attributes.position.needsUpdate = true;
+    this.geo.attributes.color.needsUpdate = true;
   }
 }
 
-function update() {
-  // charge gathers the shell inward & tightens it; explode flings it out
-  const restR = (8 + ctrl.scale * 16) * (1 - ctrl.charge * 0.55);
-  radius += (restR - radius) * 0.10;
-
-  // rotation: smoothed toward target, plus a slow idle spin
-  spin += source === 'demo' ? 0.0007 : 0.0003;
-  yawS   += (ctrl.yaw   - yawS)   * 0.045;
-  pitchS += (ctrl.pitch - pitchS) * 0.045;
-  group.rotation.y = spin + yawS;
-  group.rotation.x = pitchS;
-
-  // position: follow the hand (camera mode); ease back to centre otherwise
-  const span = 26;
-  posXS += (ctrl.posX * span - posXS) * 0.07;
-  posYS += (ctrl.posY * span - posYS) * 0.07;
-  group.position.set(posXS, posYS, 0);
-
-  scaleS += (ctrl.scale - scaleS) * 0.10;
-
-  if (ctrl.explode) { triggerExplode(); ctrl.explode = false; }
-
-  const hue = hueFromTemp(ctrl.temp);
-  const k = 0.06 + ctrl.charge * 0.05;   // stiffer spring while charging
-  const damp = 0.90;
-  for (let i = 0; i < N; i++) {
-    const ix = i*3, iy = i*3+1, iz = i*3+2;
-    const tx = baseDir[ix]*radius, ty = baseDir[iy]*radius, tz = baseDir[iz]*radius;
-    vel[ix] += (tx - pos[ix]) * k; vel[iy] += (ty - pos[iy]) * k; vel[iz] += (tz - pos[iz]) * k;
-    vel[ix] *= damp; vel[iy] *= damp; vel[iz] *= damp;
-    pos[ix] += vel[ix]; pos[iy] += vel[iy]; pos[iz] += vel[iz];
-
-    const sp = Math.min(1, (vel[ix]*vel[ix]+vel[iy]*vel[iy]+vel[iz]*vel[iz]) * 0.02);
-    const light = 0.42 + sp * 0.45 + ctrl.charge * 0.25;
-    const sat = 0.85 - ctrl.charge * 0.5;   // white-hot core when charged
-    col.setHSL((hue + i / N * 0.08) % 1, sat, Math.min(0.95, light));
-    colors[ix] = col.r; colors[iy] = col.g; colors[iz] = col.b;
-  }
-  geo.attributes.position.needsUpdate = true;
-  geo.attributes.color.needsUpdate = true;
-
-  document.getElementById('readout').innerHTML =
-    `roll ${ctrl.roll.toFixed(1)}&nbsp; pitch ${(ctrl.pitch*57.3).toFixed(1)}&nbsp; ` +
-    `dist ${ctrl.dist < 0 ? '—' : ctrl.dist.toFixed(1)}&nbsp; temp ${ctrl.temp.toFixed(1)}`;
+// map a board CSV frame onto a storm's control state (shared by serial + remote)
+function applyBoardFrame(storm, f) {
+  const c = storm.ctrl;
+  c.roll = +f.roll || 0;
+  c.yaw = (+f.roll || 0) * Math.PI/180 * 1.1;
+  c.pitch = (+f.pitch || 0) * Math.PI/180 * 1.1;
+  const d = (f.dist == null ? -1 : +f.dist);
+  c.dist = d;
+  if (d >= 0) { const norm = clamp((d - 4) / 36, 0, 1); c.scale = 0.6 + norm * 1.6; c.charge = 1 - norm; }
+  else c.charge = 0;
+  if (Number.isFinite(+f.temp)) c.temp = +f.temp;
+  if (+f.gesture === 1) c.explode = true;
+  c.posX = 0; c.posY = 0;
 }
+
+// =====================================================================
+//  Storm registry + layout (local host always present, players join/leave)
+// =====================================================================
+const storms = new Map();             // id -> Storm  (insertion order = layout order)
+const LOCAL_N = 2600, REMOTE_N = 1400;
+const local = new Storm(LOCAL_N, 0);
+storms.set('local', local);
+
+function hashHue(id) {                  // small stable hue offset per player (stays bluish)
+  let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  return ((h % 100) / 100 - 0.5) * 0.18;
+}
+
+function addStorm(id) {
+  if (storms.has(id)) return;
+  storms.set(id, new Storm(REMOTE_N, hashHue(id)));
+  layout(); updatePlayerCount();
+}
+function removeStorm(id) {
+  const s = storms.get(id); if (!s) return;
+  s.dispose(); storms.delete(id);
+  layout(); updatePlayerCount();
+}
+function updatePlayerCount() {
+  const n = storms.size - 1;            // exclude local host
+  document.getElementById('playerCount').textContent = n;
+}
+
+function layout() {
+  const list = [...storms.values()];
+  const c = list.length;
+  const spacing = c <= 1 ? 0 : Math.min(40, 120 / (c - 1));
+  const baseScale = c <= 1 ? 1 : clamp((spacing * 0.95) / 40, 0.45, 1);
+  list.forEach((s, i) => { s.targetX = i * spacing - (c - 1) * spacing / 2; s.baseScale = baseScale; });
+  camera.position.z = clamp(70 + (c - 1) * 7, 70, 120);
+}
+
+// =====================================================================
+//  Render loop
+// =====================================================================
+let activeSource = 'demo';   // drives the LOCAL storm only: 'demo' | 'camera' | 'serial'
 
 function renderFrame() {
-  // 1) fade the previous accumulation buffer into the current one
+  const idle = activeSource === 'demo';
+  for (const s of storms.values()) s.update(idle);
+
+  // fade previous accumulation buffer -> current
   copyMat.uniforms.tDiffuse.value = rtA.texture;
   copyMat.uniforms.fade.value = TRAIL_FADE;
   renderer.setRenderTarget(rtB);
   renderer.autoClear = true;
   renderer.render(fsScene, fsCam);
-
-  // 2) add fresh particles on top (additive)
+  // add fresh particles on top (additive)
   renderer.autoClear = false;
   renderer.render(scene, camera);
   renderer.autoClear = true;
-
-  // 3) show the accumulation buffer (screen-blended over the webcam via CSS)
+  // show accumulation buffer (screen-blended over the webcam via CSS)
   copyMat.uniforms.tDiffuse.value = rtB.texture;
   copyMat.uniforms.fade.value = 1.0;
   renderer.setRenderTarget(null);
   renderer.render(fsScene, fsCam);
 
-  const t = rtA; rtA = rtB; rtB = t;   // swap
+  const t = rtA; rtA = rtB; rtB = t;
 }
 
 function animate() {
-  // poll the hand tracker if the camera is live
-  if (source === 'camera' && handLandmarker && video.readyState >= 2) pollHands();
-  update();
+  if (activeSource === 'camera' && handLandmarker && video.readyState >= 2) pollHands();
   renderFrame();
+  if (audio) {                       // drive the ambient soundscape from controller activity
+    let charge = 0, tilt = 0, n = 0;
+    for (const s of storms.values()) { charge = Math.max(charge, s.ctrl.charge); tilt += s.ctrl.pitch; n++; }
+    audio.setActivity(charge, clamp(tilt / Math.max(1, n), -1.5, 1.5));
+  }
+  const c = local.ctrl;
+  document.getElementById('readout').innerHTML =
+    `roll ${c.roll.toFixed(1)}&nbsp; pitch ${(c.pitch*57.3).toFixed(1)}&nbsp; ` +
+    `dist ${c.dist < 0 ? '—' : c.dist.toFixed(1)}&nbsp; temp ${c.temp.toFixed(1)}`;
   requestAnimationFrame(animate);
 }
 requestAnimationFrame(animate);
 
 // =====================================================================
-//  Demo controls (no controller connected) — mouse + space
+//  ZenAudio — generative lofi/zen soundscape (Web Audio, no samples).
+//  Ambient drone pad + tape wobble + soft vinyl crackle + a slow lofi pulse,
+//  reacting to controller activity. Every explosion rings a pentatonic bell,
+//  so any board (local or remote) "plays" the laptop in harmony.
 // =====================================================================
-addEventListener('mousemove', (e) => {
-  if (source !== 'demo') return;
-  ctrl.yaw   =  (e.clientX / innerWidth  - 0.5) * 2.2;
-  ctrl.pitch = -(e.clientY / innerHeight - 0.5) * 1.6;
-  ctrl.scale = 0.7 + (e.clientY / innerHeight) * 1.1;
-});
-addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && source === 'demo') { e.preventDefault(); ctrl.explode = true; }
-});
+class ZenAudio {
+  constructor() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = this.ctx = new Ctx();
+
+    this.master = ctx.createGain(); this.master.gain.value = 0; this.master.connect(ctx.destination);
+    this.muted = false;
+    this.scale = [440, 523.25, 587.33, 659.25, 783.99, 880]; // A major pentatonic (A4..A5)
+    this.cutBase = 680;
+
+    // reverb (synthetic impulse) with wet/dry sends
+    this.reverb = ctx.createConvolver(); this.reverb.buffer = this._impulse(3.4, 2.4);
+    this.wet = ctx.createGain(); this.wet.gain.value = 0.55; this.reverb.connect(this.wet); this.wet.connect(this.master);
+    this.dry = ctx.createGain(); this.dry.gain.value = 0.9; this.dry.connect(this.master);
+
+    // warm lowpass pad bus
+    this.padFilter = ctx.createBiquadFilter();
+    this.padFilter.type = 'lowpass'; this.padFilter.frequency.value = this.cutBase; this.padFilter.Q.value = 0.7;
+    this.padGain = ctx.createGain(); this.padGain.gain.value = 0.22;
+    this.padFilter.connect(this.padGain); this.padGain.connect(this.dry); this.padGain.connect(this.reverb);
+
+    // calm open-chord drone, detuned + tape wobble for lofi warmth
+    [110, 164.81, 220].forEach((f, i) => {
+      const o = ctx.createOscillator(); o.type = i === 0 ? 'sine' : 'triangle'; o.frequency.value = f;
+      const g = ctx.createGain(); g.gain.value = i === 0 ? 0.5 : 0.28;
+      o.connect(g); g.connect(this.padFilter); o.start();
+      const lfo = ctx.createOscillator(); lfo.frequency.value = 0.10 + i * 0.035;
+      const lg = ctx.createGain(); lg.gain.value = 2.5; lfo.connect(lg); lg.connect(o.detune); lfo.start();
+    });
+
+    // slow "breathing" on the filter cutoff
+    const breath = ctx.createOscillator(); breath.frequency.value = 0.06;
+    const bg = ctx.createGain(); bg.gain.value = 200;
+    breath.connect(bg); bg.connect(this.padFilter.frequency); breath.start();
+
+    // subtle vinyl crackle
+    this._noise(0.012, 3200);
+
+    // continuous shimmer voice driven by charge/activity
+    this.shimmer = ctx.createOscillator(); this.shimmer.type = 'sine'; this.shimmer.frequency.value = 760;
+    this.shimGain = ctx.createGain(); this.shimGain.gain.value = 0;
+    this.shimmer.connect(this.shimGain); this.shimGain.connect(this.reverb); this.shimmer.start();
+
+    // gentle lofi pulse (~70 bpm)
+    this.beatTimer = setInterval(() => this._kick(), 850);
+  }
+
+  _impulse(dur, decay) {
+    const ctx = this.ctx, rate = ctx.sampleRate, len = (rate * dur) | 0;
+    const buf = ctx.createBuffer(2, len, rate);
+    for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c);
+      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay); }
+    return buf;
+  }
+  _noise(gainVal, hpFreq) {
+    const ctx = this.ctx, len = ctx.sampleRate * 2, buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * 0.5;
+    const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = hpFreq;
+    const g = ctx.createGain(); g.gain.value = gainVal;
+    src.connect(hp); hp.connect(g); g.connect(this.dry); src.start();
+  }
+  _kick() {
+    if (this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.setValueAtTime(120, t); o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.16, t + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+    o.connect(g); g.connect(this.dry); o.start(t); o.stop(t + 0.3);
+  }
+
+  start() {
+    this.ctx.resume();
+    const t = this.ctx.currentTime;
+    this.master.gain.cancelScheduledValues(t);
+    this.master.gain.setValueAtTime(this.master.gain.value, t);
+    this.master.gain.linearRampToValueAtTime(0.5, t + 2.5);
+  }
+  toggleMute() {
+    this.muted = !this.muted;
+    const t = this.ctx.currentTime;
+    this.master.gain.cancelScheduledValues(t);
+    this.master.gain.linearRampToValueAtTime(this.muted ? 0 : 0.5, t + 0.6);
+    return this.muted;
+  }
+
+  // continuous: level 0..1 (aggregate charge), tilt radians
+  setActivity(level, tilt) {
+    const t = this.ctx.currentTime;
+    this.padFilter.frequency.setTargetAtTime(this.cutBase + level * 1800 + Math.abs(tilt) * 300, t, 0.3);
+    this.shimGain.gain.setTargetAtTime(level * 0.05, t, 0.2);
+    this.shimmer.frequency.setTargetAtTime(660 + level * 660 + tilt * 90, t, 0.3);
+  }
+
+  // pentatonic bell / singing bowl on each explosion (warmer temp -> higher note)
+  chime(temp) {
+    if (this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const warm = clamp((temp - 18) / 14, 0, 1);
+    const idx = clamp(Math.floor(warm * (this.scale.length - 1) + (Math.random() * 2 - 1)), 0, this.scale.length - 1);
+    const base = this.scale[idx];
+    [[1, 0.5], [2.0, 0.24], [2.76, 0.13], [5.4, 0.05]].forEach(([ratio, amp]) => {
+      const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = base * ratio;
+      const g = ctx.createGain(); g.gain.value = 0;
+      o.connect(g); g.connect(this.reverb); g.connect(this.dry);
+      const a = 0.005, dec = 2.0 + Math.random() * 1.4;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(amp * 0.5, t + a);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + a + dec);
+      o.start(t); o.stop(t + a + dec + 0.1);
+    });
+  }
+}
 
 // =====================================================================
 //  UI helpers
@@ -303,56 +490,55 @@ const statusEl   = document.getElementById('status');
 const statusText = document.getElementById('statusText');
 const camBtn     = document.getElementById('camBtn');
 const serialBtn  = document.getElementById('serialBtn');
+const soundBtn   = document.getElementById('soundBtn');
 const resetBtn   = document.getElementById('resetBtn');
 const toastEl    = document.getElementById('toast');
 let toastTimer = 0;
 
-function setStatus(live, text) {
-  statusEl.classList.toggle('live', live);
-  statusText.textContent = text;
-}
-function toast(msg, ms = 2600) {
+function setStatus(live, text) { statusEl.classList.toggle('live', live); statusText.textContent = text; }
+function toast(msg, ms = 2800) {
   toastEl.textContent = msg; toastEl.classList.add('show');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), ms);
 }
 function setSource(s) {
-  source = s;
+  activeSource = s;
   camBtn.classList.toggle('active', s === 'camera');
   serialBtn.classList.toggle('active', s === 'serial');
 }
 
-resetBtn.addEventListener('click', () => {
-  for (let i = 0; i < N; i++) {
-    pos[i*3] = baseDir[i*3]*18; pos[i*3+1] = baseDir[i*3+1]*18; pos[i*3+2] = baseDir[i*3+2]*18;
-    vel[i*3] = vel[i*3+1] = vel[i*3+2] = 0;
-  }
-  ctrl.charge = 0; ctrl.scale = 1; ctrl.yaw = 0; ctrl.pitch = 0;
-  ctrl.posX = 0; ctrl.posY = 0; spin = 0;
-  toast('reset');
+resetBtn.addEventListener('click', () => { for (const s of storms.values()) s.reset(); toast('reset'); });
+
+// zen lofi soundscape — created on first click (browsers need a user gesture for audio)
+soundBtn.addEventListener('click', () => {
+  if (!audio) { audio = new ZenAudio(); audio.start(); soundBtn.classList.add('active'); toast('zen lofi on · explosions ring bells'); }
+  else { const m = audio.toggleMute(); soundBtn.classList.toggle('active', !m); toast(m ? 'sound muted' : 'zen lofi on'); }
+});
+
+// demo controls (drive local storm with mouse + space)
+addEventListener('mousemove', (e) => {
+  if (activeSource !== 'demo') return;
+  local.ctrl.yaw   =  (e.clientX / innerWidth  - 0.5) * 2.2;
+  local.ctrl.pitch = -(e.clientY / innerHeight - 0.5) * 1.6;
+  local.ctrl.scale = 0.7 + (e.clientY / innerHeight) * 1.1;
+});
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && activeSource === 'demo') { e.preventDefault(); local.ctrl.explode = true; }
 });
 
 // =====================================================================
-//  CAMERA controller — webcam + MediaPipe hand tracking
+//  CAMERA controller (local) — webcam + MediaPipe hand tracking
 // =====================================================================
 const video = document.getElementById('cam');
-let handLandmarker = null;
-let camActive = false;
+let handLandmarker = null, camActive = false;
 
 camBtn.addEventListener('click', async () => {
-  if (camActive) {           // toggle off
-    stopCamera();
-    return;
-  }
+  if (camActive) { stopCamera(); return; }
   camBtn.disabled = true;
   setStatus(false, 'starting camera…');
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, facingMode: 'user' }, audio: false,
-    });
-    video.srcObject = stream;
-    await video.play();
-    video.classList.add('on');
-
+      video: { width: 1280, height: 720, facingMode: 'user' }, audio: false });
+    video.srcObject = stream; await video.play(); video.classList.add('on');
     if (!handLandmarker) {
       toast('loading hand tracker…', 4000);
       const { HandLandmarker, FilesetResolver } =
@@ -362,105 +548,60 @@ camBtn.addEventListener('click', async () => {
       handLandmarker = await HandLandmarker.createFromOptions(fileset, {
         baseOptions: {
           modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-          delegate: 'GPU',
-        },
-        runningMode: 'VIDEO',
-        numHands: 2,
-      });
+          delegate: 'GPU' },
+        runningMode: 'VIDEO', numHands: 2 });
     }
-    camActive = true;
-    setSource('camera');
+    camActive = true; setSource('camera');
     setStatus(true, 'camera live — show your hand');
     toast('move your hand · pinch to charge · release to explode', 3200);
   } catch (err) {
-    console.error(err);
-    setStatus(false, 'camera blocked');
-    toast('camera error: ' + (err.message || err));
-    video.classList.remove('on');
-  } finally {
-    camBtn.disabled = false;
-  }
+    console.error(err); setStatus(false, 'camera blocked');
+    toast('camera error: ' + (err.message || err)); video.classList.remove('on');
+  } finally { camBtn.disabled = false; }
 });
 
 function stopCamera() {
-  camActive = false;
-  video.classList.remove('on');
-  const s = video.srcObject;
-  if (s) s.getTracks().forEach((t) => t.stop());
+  camActive = false; video.classList.remove('on');
+  const s = video.srcObject; if (s) s.getTracks().forEach((t) => t.stop());
   video.srcObject = null;
-  if (source === 'camera') { setSource('demo'); setStatus(false, 'demo mode'); }
+  if (activeSource === 'camera') { setSource('demo'); setStatus(false, 'demo mode'); }
 }
 
-// --- hand → ctrl mapping ---------------------------------------------
-const PINCH_ON = 0.45, PINCH_OFF = 0.30;   // hysteresis on pinch strength
+const PINCH_ON = 0.45, PINCH_OFF = 0.30;
 let pinching = false, lastVidTs = -1;
-
-function lm(landmarks, i) { return landmarks[i]; }
-function dist3(a, b) {
-  const dx = a.x-b.x, dy = a.y-b.y, dz = (a.z||0)-(b.z||0);
-  return Math.hypot(dx, dy, dz);
-}
+const dist3 = (a, b) => Math.hypot(a.x-b.x, a.y-b.y, (a.z||0)-(b.z||0));
 
 function pollHands() {
-  // detectForVideo requires a strictly-increasing timestamp
   const ts = video.currentTime * 1000;
   if (ts === lastVidTs) return;
   lastVidTs = ts;
-
-  let res;
-  try { res = handLandmarker.detectForVideo(video, performance.now()); }
-  catch { return; }
+  let res; try { res = handLandmarker.detectForVideo(video, performance.now()); } catch { return; }
   const hands = res && res.landmarks ? res.landmarks : [];
-
-  if (hands.length === 0) {
-    // hand lost: relax charge so a vanished hand doesn't stay charged forever
-    ctrl.charge *= 0.85;
-    return;
-  }
-
-  // primary hand drives rotation / position / pinch
+  const c = local.ctrl;
+  if (hands.length === 0) { c.charge *= 0.85; return; }
   const h = hands[0];
-  const wrist = lm(h, 0), midMcp = lm(h, 9), thumb = lm(h, 4), index = lm(h, 8);
-  // palm centre (mirror x to match the selfie-flipped video the user sees)
-  const palmX = 1 - midMcp.x, palmY = midMcp.y;
-  ctrl.posX = (palmX - 0.5) * 2.0;
-  ctrl.posY = -(palmY - 0.5) * 2.0;
-  // hand position also tilts the sphere
-  ctrl.yaw   = (palmX - 0.5) * 3.0;
-  ctrl.pitch = -(palmY - 0.5) * 1.6;
-
-  // pinch strength, normalised by hand size so distance to camera doesn't matter
+  const wrist = h[0], midMcp = h[9], thumb = h[4], index = h[8];
+  const palmX = 1 - midMcp.x, palmY = midMcp.y;     // mirror x to match selfie view
+  c.posX = (palmX - 0.5) * 2.0; c.posY = -(palmY - 0.5) * 2.0;
+  c.yaw = (palmX - 0.5) * 3.0; c.pitch = -(palmY - 0.5) * 1.6;
   const span = Math.max(1e-3, dist3(wrist, midMcp));
-  const pinchRaw = dist3(thumb, index) / span;
-  const pinchStrength = clamp(1 - (pinchRaw - 0.25) / 0.75, 0, 1);
-  ctrl.charge = pinchStrength;
-
+  const pinchStrength = clamp(1 - (dist3(thumb, index) / span - 0.25) / 0.75, 0, 1);
+  c.charge = pinchStrength;
   if (!pinching && pinchStrength > PINCH_ON) pinching = true;
-  else if (pinching && pinchStrength < PINCH_OFF) {     // release = explode
-    pinching = false;
-    ctrl.explode = true;
-  }
-
-  // two hands → pinch-to-scale on the distance between palms
+  else if (pinching && pinchStrength < PINCH_OFF) { pinching = false; c.explode = true; }
   if (hands.length >= 2) {
-    const m2 = lm(hands[1], 9);
+    const m2 = hands[1][9];
     const d = Math.hypot((1 - m2.x) - palmX, m2.y - palmY);
-    ctrl.scale = clamp(d * 3.2, 0.5, 2.4);
+    c.scale = clamp(d * 3.2, 0.5, 2.4);
   }
-
-  ctrl.dist = -1; // not meaningful in camera mode
+  c.dist = -1;
 }
 
 // =====================================================================
-//  SERIAL controller — STM32 board over Web Serial
-//  Stream: "roll,pitch,dist,temp,gesture\n" @115200 (lines with # ignored)
+//  SERIAL controller (local) — STM32 board over Web Serial
 // =====================================================================
 let serialPort = null;
-
-if (!('serial' in navigator)) {
-  serialBtn.disabled = true;
-  serialBtn.title = 'Web Serial needs Chrome/Edge';
-}
+if (!('serial' in navigator)) { serialBtn.disabled = true; serialBtn.title = 'Web Serial needs Chrome/Edge'; }
 
 serialBtn.addEventListener('click', async () => {
   if (serialPort) { try { await serialPort.close(); } catch {} serialPort = null; return; }
@@ -469,13 +610,10 @@ serialBtn.addEventListener('click', async () => {
     await port.open({ baudRate: 115200 });
     serialPort = port;
     if (camActive) stopCamera();
-    setSource('serial');
-    setStatus(true, 'board connected');
+    setSource('serial'); setStatus(true, 'board connected');
     toast('tilt = rotate · hand over sensor = scale · shake = explode', 3200);
     readSerial(port);
-  } catch {
-    setStatus(false, source === 'demo' ? 'demo mode' : statusText.textContent);
-  }
+  } catch { setStatus(false, activeSource === 'demo' ? 'demo mode' : statusText.textContent); }
 });
 
 async function readSerial(port) {
@@ -484,8 +622,7 @@ async function readSerial(port) {
   const reader = decoder.readable.getReader();
   let buf = '';
   while (true) {
-    let res;
-    try { res = await reader.read(); } catch { break; }
+    let res; try { res = await reader.read(); } catch { break; }
     if (res.done) break;
     buf += res.value;
     let nl;
@@ -495,26 +632,52 @@ async function readSerial(port) {
       if (!line || line[0] === '#') continue;
       const p = line.split(',');
       if (p.length < 5) continue;
-      const roll = +p[0], pitch = +p[1], d = +p[2], temp = +p[3], g = +p[4];
-      if (Number.isFinite(roll))  { ctrl.roll = roll; ctrl.yaw   = roll * Math.PI/180 * 1.1; }
-      if (Number.isFinite(pitch)) { ctrl.pitch = pitch * Math.PI/180 * 1.1; }
-      if (Number.isFinite(d)) {
-        ctrl.dist = d;
-        if (d >= 0) {
-          // close hand = gather/charge + shrink; far = spread
-          const norm = clamp((d - 4) / 36, 0, 1);
-          ctrl.scale  = 0.6 + norm * 1.6;
-          ctrl.charge = 1 - norm;
-        } else { ctrl.charge = 0; }
-      }
-      if (Number.isFinite(temp)) ctrl.temp = temp;
-      if (g === 1) ctrl.explode = true;
-      ctrl.posX = ctrl.posY = 0;   // board mode keeps the sphere centred
+      applyBoardFrame(local, { roll: p[0], pitch: p[1], dist: p[2], temp: p[3], gesture: +p[4] });
     }
   }
   serialPort = null;
-  if (source === 'serial') { setSource('demo'); setStatus(false, 'board disconnected'); }
+  if (activeSource === 'serial') { setSource('demo'); setStatus(false, 'board disconnected'); }
 }
+
+// =====================================================================
+//  Multiplayer — connect to the relay, show the join QR, spawn remote storms.
+//  Only active when served by the relay (which exposes /config). Falls back to
+//  standalone (demo/camera/serial) on a plain static server.
+// =====================================================================
+async function initRoom() {
+  let cfg;
+  try {
+    const r = await fetch('/config', { cache: 'no-store' });
+    if (!r.ok) throw new Error('config ' + r.status);
+    cfg = await r.json();
+    console.log('[room] config', cfg);
+  } catch (err) { console.warn('[room] no relay:', err); return; }   // standalone mode
+
+  // show the join QR (bottom-right) — rendered server-side, no CDN needed
+  document.getElementById('qr').src = '/qr.svg';
+  document.getElementById('join').style.display = 'flex';
+
+  connectRoom();
+}
+
+function connectRoom() {
+  let ws;
+  try { ws = new WebSocket(`wss://${location.host}`); } catch { return; }
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', role: 'display' }));
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === 'join') addStorm(m.id);
+    else if (m.type === 'leave') removeStorm(m.id);
+    else if (m.type === 'frame') { const s = storms.get(m.id); if (s) applyBoardFrame(s, m); }
+  };
+  ws.onclose = () => {
+    for (const id of [...storms.keys()]) if (id !== 'local') removeStorm(id);
+    setTimeout(connectRoom, 2000);   // auto-reconnect
+  };
+  ws.onerror = () => {};
+}
+
+initRoom();
 </script>
 </body>
 </html>

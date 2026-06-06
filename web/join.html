@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Join · Particle Storm</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; background: radial-gradient(120% 120% at 50% 0%, #14102a 0%, #05040a 60%);
+    color: #fff; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 24px; overflow: hidden; }
+  .card { width: 100%; max-width: 380px; text-align: center; }
+  h1 { font-size: 13px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; opacity: .9; }
+  h1 small { display: block; font-weight: 400; letter-spacing: .04em; text-transform: none; opacity: .5; margin-top: 6px; font-size: 12px; }
+  .orb { width: 132px; height: 132px; margin: 30px auto 26px; border-radius: 50%;
+    background: radial-gradient(circle at 38% 32%, #8be9ff, #4361ff 45%, #1a1240 80%);
+    box-shadow: 0 0 50px rgba(67,97,255,.5), inset 0 0 30px rgba(0,0,0,.4);
+    transition: transform .08s linear, box-shadow .2s; }
+  .orb.live { box-shadow: 0 0 70px rgba(54,224,138,.6), inset 0 0 30px rgba(0,0,0,.4); }
+  button { width: 100%; font: inherit; font-size: 15px; font-weight: 700; color: #fff;
+    background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.25);
+    padding: 15px 18px; border-radius: 14px; cursor: pointer; margin-top: 12px;
+    backdrop-filter: blur(8px); transition: background .15s, transform .1s; }
+  button:hover { background: rgba(255,255,255,.18); }
+  button:active { transform: scale(.97); }
+  button.primary { background: linear-gradient(135deg, #4361ff, #8be9ff); color: #05040a; border: none; }
+  button:disabled { opacity: .4; cursor: default; }
+  #status { margin-top: 20px; font-size: 13px; opacity: .8; min-height: 20px; }
+  #status .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#777;
+    margin-right:7px; vertical-align:middle; }
+  #status.live .dot { background:#36e08a; box-shadow:0 0 8px #36e08a; }
+  #readout { margin-top: 10px; font-size: 12px; opacity: .45; font-variant-numeric: tabular-nums; min-height: 16px; }
+  .hint { margin-top: 22px; font-size: 12px; opacity: .45; line-height: 1.6; }
+  .explode { margin-top: 14px; background: rgba(255,90,140,.16); border-color: rgba(255,90,140,.5); display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Particle Storm<small>become a controller</small></h1>
+  <div class="orb" id="orb"></div>
+
+  <button class="primary" id="boardBtn">Connect STM32 board</button>
+  <button id="phoneBtn">Use this phone's motion</button>
+  <button class="explode" id="explodeBtn">💥 Explode</button>
+
+  <div id="status"><span class="dot"></span><span id="statusText">choose how to join</span></div>
+  <div id="readout"></div>
+
+  <div class="hint" id="hint">
+    Board: plug the STM32 into a laptop, open in Chrome/Edge.<br>
+    Phone: tilt to rotate · shake to explode.
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status'), statusText = $('statusText'), readout = $('readout'), orb = $('orb');
+
+function setStatus(live, text) { statusEl.classList.toggle('live', live); statusText.textContent = text; }
+function toast(t) { $('hint').textContent = t; }
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+
+// ---- relay connection ----
+let ws = null, myId = null, connected = false;
+const frame = { roll: 0, pitch: 0, dist: -1, temp: 25, gesture: 0 };
+
+function connectRelay(onReady) {
+  ws = new WebSocket(`wss://${location.host}`);
+  ws.onopen = () => { ws.send(JSON.stringify({ type: 'hello', role: 'player' })); };
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === 'welcome') { myId = m.id; connected = true; onReady && onReady(); }
+  };
+  ws.onclose = () => { connected = false; setStatus(false, 'disconnected — refresh to rejoin'); };
+  ws.onerror = () => {};
+}
+
+// throttle frame sends to ~40 Hz
+let lastSend = 0;
+function sendFrame() {
+  if (!connected || ws.readyState !== WebSocket.OPEN) return;
+  const now = performance.now();
+  if (now - lastSend < 25) { frame.gesture = 0; return; }
+  lastSend = now;
+  ws.send(JSON.stringify({ type: 'frame', ...frame }));
+  readout.textContent = `roll ${frame.roll.toFixed(0)}  pitch ${frame.pitch.toFixed(0)}` +
+    (frame.dist >= 0 ? `  dist ${frame.dist.toFixed(0)}` : '') + `  temp ${frame.temp.toFixed(0)}`;
+  if (frame.gesture) { orb.classList.add('live'); setTimeout(() => orb.classList.remove('live'), 200); }
+  frame.gesture = 0; // one-shot
+  orb.style.transform = `rotate(${frame.roll}deg) rotateX(${frame.pitch}deg)`;
+}
+
+// =====================================================================
+//  Controller A — STM32 board over Web Serial
+//  Reads the firmware's "roll,pitch,dist,temp,gesture" CSV stream.
+// =====================================================================
+$('boardBtn').addEventListener('click', async () => {
+  if (!('serial' in navigator)) { toast('Web Serial needs Chrome or Edge on a laptop.'); return; }
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    connectRelay(() => setStatus(true, `board connected — you are ${myId}`));
+    $('boardBtn').disabled = true; $('phoneBtn').disabled = true;
+    toast('Your board is now driving the shared screen.');
+    readBoard(port);
+  } catch { setStatus(false, 'connect cancelled'); }
+});
+
+async function readBoard(port) {
+  const decoder = new TextDecoderStream();
+  port.readable.pipeTo(decoder.writable).catch(() => {});
+  const reader = decoder.readable.getReader();
+  let buf = '';
+  while (true) {
+    let res; try { res = await reader.read(); } catch { break; }
+    if (res.done) break;
+    buf += res.value;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line || line[0] === '#') continue;
+      const p = line.split(',');
+      if (p.length < 5) continue;
+      frame.roll = +p[0] || 0; frame.pitch = +p[1] || 0;
+      frame.dist = Number.isFinite(+p[2]) ? +p[2] : -1;
+      frame.temp = Number.isFinite(+p[3]) ? +p[3] : 25;
+      if (+p[4] === 1) frame.gesture = 1;
+      sendFrame();
+    }
+  }
+  setStatus(false, 'board disconnected');
+}
+
+// =====================================================================
+//  Controller B — this phone's motion sensors (the world is your controller)
+//  Tilt -> roll/pitch, shake -> explode.
+// =====================================================================
+$('phoneBtn').addEventListener('click', async () => {
+  // iOS requires explicit permission, granted from a user gesture over https
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== 'granted') { toast('Motion permission denied.'); return; }
+    }
+    if (typeof DeviceMotionEvent !== 'undefined' &&
+        typeof DeviceMotionEvent.requestPermission === 'function') {
+      await DeviceMotionEvent.requestPermission().catch(() => {});
+    }
+  } catch {}
+
+  if (!('DeviceOrientationEvent' in window)) { toast('No motion sensors on this device.'); return; }
+
+  connectRelay(() => setStatus(true, `phone connected — you are ${myId}`));
+  $('boardBtn').disabled = true; $('phoneBtn').disabled = true;
+  $('explodeBtn').style.display = 'block';
+  toast('Tilt to rotate · shake or tap Explode.');
+
+  addEventListener('deviceorientation', (e) => {
+    if (e.gamma == null) return;
+    frame.roll = clamp(e.gamma, -90, 90);          // left/right tilt
+    frame.pitch = clamp((e.beta || 0) - 45, -90, 90); // front/back tilt (held upright ~45)
+    sendFrame();
+  });
+
+  let lastShake = 0;
+  addEventListener('devicemotion', (e) => {
+    const a = e.accelerationIncludingGravity; if (!a) return;
+    const mag = Math.hypot(a.x || 0, a.y || 0, a.z || 0);
+    const now = performance.now();
+    if (mag > 22 && now - lastShake > 400) { lastShake = now; frame.gesture = 1; sendFrame(); }
+  });
+});
+
+$('explodeBtn').addEventListener('click', () => { frame.gesture = 1; sendFrame(); });
+
+if (!('WebSocket' in window)) setStatus(false, 'browser not supported');
+</script>
+</body>
+</html>

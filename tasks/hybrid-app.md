@@ -41,6 +41,38 @@ Both controllers feed one shared `ctrl` state, so the visuals are identical rega
 ## Review
 Shipped `web/hand-particle-sphere.html`: hybrid Particle Storm. CAMERA mode uses MediaPipe
 hand tracking over the live webcam; SERIAL mode uses the STM32 CSV stream. Same particle
-engine (3000 pts, spring-to-shell, charge/explode, temp→hue) with render-target trail
-persistence for the light-streak explosions seen in the reel. Existing `web/index.html`
-left intact as the minimal hardware demo.
+engine (spring-to-shell, charge/explode, temp→hue) with render-target trail persistence for
+the light-streak explosions seen in the reel. Existing `web/index.html` left intact.
+
+## Multiplayer (LAN) — added
+Others bring their own board and feed THIS screen.
+- `server/relay.js` — HTTPS (self-signed cert covering the LAN IP) + WebSocket relay.
+  Serves the web app, exposes `/config` (LAN join URL) and `/qr.svg` (server-rendered QR,
+  no browser CDN needed). Relays player `frame`s to all displays; tracks join/leave.
+- `web/join.html` — joiner page. Connect an STM32 board (Web Serial) OR use the phone's
+  own motion sensors (tilt = rotate, shake = explode). Streams frames to the relay.
+- Display refactored to a `Storm` class: the local host is one storm; every joiner gets
+  their own storm laid out across the screen. QR shown bottom-right with live player count.
+- HTTPS is mandatory: Web Serial + getUserMedia need a secure context, which a plain
+  http://192.168.x.x LAN address is NOT. Joiners accept the one-time cert warning.
+
+Run: `cd server && npm install && npm start` → open the printed https URL (accept cert).
+Verified end-to-end with Playwright: QR loads, remote player join→storm spawn, leave→cleanup,
+zero console errors.
+
+## Zen / lofi audio — added
+"The world is your controller" now also plays it.
+- `web/hand-particle-sphere.html` — `ZenAudio`: a generative Web Audio soundscape (no
+  samples, works offline). Ambient detuned drone + tape wobble + soft vinyl crackle + a
+  gentle ~70 bpm lofi pulse, all reacting to controller activity (charge brightens the pad
+  and a shimmer voice; tilt shifts it). Every explosion — from ANY board, local or remote —
+  rings a C-major-pentatonic bell, so the room plays the laptop in harmony. "Zen" button
+  toggles it (audio needs a user gesture to start).
+- `src/main.cpp` — the STEMMA speaker now plays zen tones too: a calm ascending pentatonic
+  arpeggio on boot and a soft pentatonic bell on each shake (replacing the old beep/whoosh).
+  Builds clean: `pio run` → SUCCESS (Flash 9.3%).
+
+### Gotcha captured
+The big display rewrite was written without its closing `</script></body></html>`; the
+module silently failed to execute (no error surfaced). Always confirm the script/body/html
+tags close after a full-file Write.
