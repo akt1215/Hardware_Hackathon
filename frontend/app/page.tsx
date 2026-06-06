@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import styles from "../components/RallyTrainer.module.css";
+import { connectImu } from "../lib/imu";
 
 type HudState = {
   score: number;
@@ -1037,7 +1038,12 @@ export default function Home() {
     window.addEventListener("keydown", onKeyDown);
     animationFrame = window.requestAnimationFrame(frame);
 
+    // MPU-6050 input: real board or sim, via the rally bridge WebSocket. Drives
+    // the same doSwing() as pointer/keyboard. No-op if the bridge isn't running.
+    const imu = connectImu(doSwing);
+
     return () => {
+      imu.close();
       if (activeMissTimeout) {
         window.clearTimeout(activeMissTimeout);
       }

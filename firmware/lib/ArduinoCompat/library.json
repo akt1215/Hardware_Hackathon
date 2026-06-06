@@ -1,0 +1,7 @@
+{
+  "name": "ArduinoCompat",
+  "version": "0.0.0",
+  "description": "Host-only Arduino core shim (native sim). Ignored on the STM32 target.",
+  "frameworks": "*",
+  "platforms": "*"
+}

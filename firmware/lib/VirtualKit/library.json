@@ -1,0 +1,10 @@
+{
+  "name": "VirtualKit",
+  "version": "0.0.0",
+  "description": "Host-only mocks of the MPU-6050 / MCP9808 / Wire with scripted gesture data.",
+  "frameworks": "*",
+  "platforms": "*",
+  "dependencies": {
+    "ArduinoCompat": "*"
+  }
+}

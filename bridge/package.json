@@ -1,0 +1,17 @@
+{
+  "name": "rally-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Forwards MPU-6050 IMU frames (sim or STM32 serial) to the browser over WebSocket.",
+  "scripts": {
+    "start": "node server.mjs",
+    "sim": "node server.mjs --sim",
+    "serial": "node server.mjs --serial"
+  },
+  "dependencies": {
+    "@serialport/parser-readline": "^13.0.0",
+    "serialport": "^13.0.0",
+    "ws": "^8.18.0"
+  }
+}
