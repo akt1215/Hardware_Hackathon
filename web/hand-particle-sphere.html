@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Particle Storm</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #05040a; overflow: hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #stage { position: fixed; inset: 0; }
+
+  /* webcam feed sits behind the particle canvas, mirrored like a selfie */
+  #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover;
+    transform: scaleX(-1); opacity: 0; transition: opacity .6s; background: #05040a; }
+  #cam.on { opacity: 1; }
+
+  /* particles render on a transparent-ish canvas; screen blend = black shows the video,
+     bright particles glow over it */
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; mix-blend-mode: screen; }
+
+  .ui { position: fixed; z-index: 10; color: #fff; }
+  #title { top: 22px; left: 26px; font-weight: 700; letter-spacing: .14em; font-size: 14px;
+    text-transform: uppercase; opacity: .9; text-shadow: 0 1px 12px rgba(0,0,0,.6); }
+  #title small { display:block; font-weight:400; letter-spacing:.05em; text-transform:none;
+    opacity:.55; margin-top:4px; }
+
+  #panel { top: 18px; right: 22px; display: flex; align-items: center; gap: 8px; }
+  button { font: inherit; font-size: 12px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: #fff; background: rgba(20,16,30,.45);
+    border: 1px solid rgba(255,255,255,.22); padding: 8px 14px; border-radius: 999px;
+    cursor: pointer; backdrop-filter: blur(8px);
+    transition: background .15s, border-color .15s, transform .1s; }
+  button:hover { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.5); }
+  button:active { transform: scale(.95); }
+  button.active { background: rgba(54,224,138,.22); border-color: rgba(54,224,138,.7);
+    box-shadow: 0 0 14px rgba(54,224,138,.35); }
+  button:disabled { opacity: .35; cursor: default; }
+
+  #status { top: 58px; right: 22px; font-size: 12px; opacity: .75;
+    text-shadow: 0 1px 10px rgba(0,0,0,.7); }
+  #status .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+    background:#777; margin-right:6px; vertical-align:middle; transition: background .2s; }
+  #status.live .dot { background:#36e08a; box-shadow:0 0 8px #36e08a; }
+
+  #controls { bottom: 18px; left: 26px; font-size: 11px; line-height: 1.05;
+    opacity: .82; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    display: grid; grid-template-columns: auto auto; gap: 7px 14px;
+    text-shadow: 0 1px 10px rgba(0,0,0,.8); }
+  #controls b { color: #8be9ff; font-weight: 800; }
+  #controls span { opacity: .85; }
+
+  #readout { bottom: 18px; right: 22px; font-size: 11px; line-height: 1.7; opacity: .5;
+    font-variant-numeric: tabular-nums; text-align: right; text-shadow: 0 1px 10px rgba(0,0,0,.8); }
+  #toast { top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 13px; opacity: 0;
+    background: rgba(10,8,16,.7); border: 1px solid rgba(255,255,255,.15);
+    padding: 12px 18px; border-radius: 12px; backdrop-filter: blur(8px);
+    transition: opacity .3s; pointer-events: none; max-width: 320px; text-align: center; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="gl"></canvas>
+
+<div id="title" class="ui">Particle Storm<small>the world is your controller</small></div>
+
+<div id="panel" class="ui">
+  <button id="camBtn">Camera</button>
+  <button id="serialBtn">Serial</button>
+  <button id="resetBtn">Reset</button>
+</div>
+<div id="status" class="ui"><span class="dot"></span><span id="statusText">demo mode</span></div>
+
+<div id="controls" class="ui">
+  <b>Move hand</b><span>rotate sphere</span>
+  <b>Pinch</b><span>charge up</span>
+  <b>Release</b><span>explode particles</span>
+  <b>Two hands</b><span>pinch to scale</span>
+</div>
+<div id="readout" class="ui">roll 0.0&nbsp; pitch 0.0&nbsp; dist —&nbsp; temp 25.0</div>
+<div id="toast" class="ui"></div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// =====================================================================
+//  Shared control state — both the camera and the board write into this,
+//  so the particle engine is identical regardless of which controller drives.
+// =====================================================================
+const ctrl = {
+  posX: 0, posY: 0,     // sphere target position on screen, -1..1 (camera only)
+  yaw: 0, pitch: 0,     // accumulated rotation (radians)
+  scale: 1,             // sphere scale multiplier
+  charge: 0,            // 0..1 gather/brighten
+  explode: false,       // one-shot burst
+  temp: 25,             // °C -> hue
+  roll: 0, dist: -1,    // raw values for the readout
+};
+let source = 'demo';    // 'demo' | 'camera' | 'serial'
+
+// =====================================================================
+//  Three.js scene + particles
+// =====================================================================
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.autoClearColor = true;
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x05040a, 0.010);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+camera.position.set(0, 0, 70);
+
+const N = 3000;
+const group = new THREE.Group();
+scene.add(group);
+
+const baseDir = new Float32Array(N * 3);   // unit direction on the sphere
+const pos     = new Float32Array(N * 3);   // current position
+const vel     = new Float32Array(N * 3);   // velocity
+const colors  = new Float32Array(N * 3);
+
+// fibonacci sphere — even point distribution
+for (let i = 0; i < N; i++) {
+  const y = 1 - (i / (N - 1)) * 2;
+  const r = Math.sqrt(1 - y * y);
+  const phi = i * Math.PI * (3 - Math.sqrt(5));
+  const dx = Math.cos(phi) * r, dy = y, dz = Math.sin(phi) * r;
+  baseDir[i*3] = dx; baseDir[i*3+1] = dy; baseDir[i*3+2] = dz;
+  pos[i*3] = dx * 18; pos[i*3+1] = dy * 18; pos[i*3+2] = dz * 18;
+}
+
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+function discTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.3, 'rgba(255,255,255,0.8)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+const mat = new THREE.PointsMaterial({
+  size: 0.95, map: discTexture(), vertexColors: true, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+group.add(new THREE.Points(geo, mat));
+
+// ---------------------------------------------------------------------
+//  Render-target feedback for glowing explosion trails (the light streaks)
+//  Each frame: fade the previous buffer, add fresh particles, show it.
+// ---------------------------------------------------------------------
+const COPY = {
+  uniforms: { tDiffuse: { value: null }, fade: { value: 1.0 } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float fade; varying vec2 vUv;
+    void main(){ gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb * fade, 1.0); }`,
+};
+const copyMat = new THREE.ShaderMaterial(COPY);
+const fsScene = new THREE.Scene();
+const fsCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+fsScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat));
+
+function makeRT() {
+  const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+  return new THREE.WebGLRenderTarget(s.x, s.y, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat, depthBuffer: false,
+  });
+}
+let rtA = makeRT(), rtB = makeRT();
+const TRAIL_FADE = 0.90;   // higher = longer streaks
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+  rtA.setSize(s.x, s.y); rtB.setSize(s.x, s.y);
+});
+
+// =====================================================================
+//  Particle dynamics
+// =====================================================================
+let radius = 18, spin = 0, yawS = 0, pitchS = 0, scaleS = 1, posXS = 0, posYS = 0;
+const col = new THREE.Color();
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const hueFromTemp = (t) => clamp((t - 18) / 14, 0, 1) * 0.12 + 0.55; // cyan-blue -> indigo
+
+function triggerExplode() {
+  for (let i = 0; i < N; i++) {
+    const k = 13 + Math.random() * 9;
+    vel[i*3]   += baseDir[i*3]   * k + (Math.random()-0.5) * 5;
+    vel[i*3+1] += baseDir[i*3+1] * k + (Math.random()-0.5) * 5;
+    vel[i*3+2] += baseDir[i*3+2] * k + (Math.random()-0.5) * 5;
+  }
+}
+
+function update() {
+  // charge gathers the shell inward & tightens it; explode flings it out
+  const restR = (8 + ctrl.scale * 16) * (1 - ctrl.charge * 0.55);
+  radius += (restR - radius) * 0.10;
+
+  // rotation: smoothed toward target, plus a slow idle spin
+  spin += source === 'demo' ? 0.0007 : 0.0003;
+  yawS   += (ctrl.yaw   - yawS)   * 0.045;
+  pitchS += (ctrl.pitch - pitchS) * 0.045;
+  group.rotation.y = spin + yawS;
+  group.rotation.x = pitchS;
+
+  // position: follow the hand (camera mode); ease back to centre otherwise
+  const span = 26;
+  posXS += (ctrl.posX * span - posXS) * 0.07;
+  posYS += (ctrl.posY * span - posYS) * 0.07;
+  group.position.set(posXS, posYS, 0);
+
+  scaleS += (ctrl.scale - scaleS) * 0.10;
+
+  if (ctrl.explode) { triggerExplode(); ctrl.explode = false; }
+
+  const hue = hueFromTemp(ctrl.temp);
+  const k = 0.06 + ctrl.charge * 0.05;   // stiffer spring while charging
+  const damp = 0.90;
+  for (let i = 0; i < N; i++) {
+    const ix = i*3, iy = i*3+1, iz = i*3+2;
+    const tx = baseDir[ix]*radius, ty = baseDir[iy]*radius, tz = baseDir[iz]*radius;
+    vel[ix] += (tx - pos[ix]) * k; vel[iy] += (ty - pos[iy]) * k; vel[iz] += (tz - pos[iz]) * k;
+    vel[ix] *= damp; vel[iy] *= damp; vel[iz] *= damp;
+    pos[ix] += vel[ix]; pos[iy] += vel[iy]; pos[iz] += vel[iz];
+
+    const sp = Math.min(1, (vel[ix]*vel[ix]+vel[iy]*vel[iy]+vel[iz]*vel[iz]) * 0.02);
+    const light = 0.42 + sp * 0.45 + ctrl.charge * 0.25;
+    const sat = 0.85 - ctrl.charge * 0.5;   // white-hot core when charged
+    col.setHSL((hue + i / N * 0.08) % 1, sat, Math.min(0.95, light));
+    colors[ix] = col.r; colors[iy] = col.g; colors[iz] = col.b;
+  }
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.color.needsUpdate = true;
+
+  document.getElementById('readout').innerHTML =
+    `roll ${ctrl.roll.toFixed(1)}&nbsp; pitch ${(ctrl.pitch*57.3).toFixed(1)}&nbsp; ` +
+    `dist ${ctrl.dist < 0 ? '—' : ctrl.dist.toFixed(1)}&nbsp; temp ${ctrl.temp.toFixed(1)}`;
+}
+
+function renderFrame() {
+  // 1) fade the previous accumulation buffer into the current one
+  copyMat.uniforms.tDiffuse.value = rtA.texture;
+  copyMat.uniforms.fade.value = TRAIL_FADE;
+  renderer.setRenderTarget(rtB);
+  renderer.autoClear = true;
+  renderer.render(fsScene, fsCam);
+
+  // 2) add fresh particles on top (additive)
+  renderer.autoClear = false;
+  renderer.render(scene, camera);
+  renderer.autoClear = true;
+
+  // 3) show the accumulation buffer (screen-blended over the webcam via CSS)
+  copyMat.uniforms.tDiffuse.value = rtB.texture;
+  copyMat.uniforms.fade.value = 1.0;
+  renderer.setRenderTarget(null);
+  renderer.render(fsScene, fsCam);
+
+  const t = rtA; rtA = rtB; rtB = t;   // swap
+}
+
+function animate() {
+  // poll the hand tracker if the camera is live
+  if (source === 'camera' && handLandmarker && video.readyState >= 2) pollHands();
+  update();
+  renderFrame();
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// =====================================================================
+//  Demo controls (no controller connected) — mouse + space
+// =====================================================================
+addEventListener('mousemove', (e) => {
+  if (source !== 'demo') return;
+  ctrl.yaw   =  (e.clientX / innerWidth  - 0.5) * 2.2;
+  ctrl.pitch = -(e.clientY / innerHeight - 0.5) * 1.6;
+  ctrl.scale = 0.7 + (e.clientY / innerHeight) * 1.1;
+});
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && source === 'demo') { e.preventDefault(); ctrl.explode = true; }
+});
+
+// =====================================================================
+//  UI helpers
+// =====================================================================
+const statusEl   = document.getElementById('status');
+const statusText = document.getElementById('statusText');
+const camBtn     = document.getElementById('camBtn');
+const serialBtn  = document.getElementById('serialBtn');
+const resetBtn   = document.getElementById('resetBtn');
+const toastEl    = document.getElementById('toast');
+let toastTimer = 0;
+
+function setStatus(live, text) {
+  statusEl.classList.toggle('live', live);
+  statusText.textContent = text;
+}
+function toast(msg, ms = 2600) {
+  toastEl.textContent = msg; toastEl.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), ms);
+}
+function setSource(s) {
+  source = s;
+  camBtn.classList.toggle('active', s === 'camera');
+  serialBtn.classList.toggle('active', s === 'serial');
+}
+
+resetBtn.addEventListener('click', () => {
+  for (let i = 0; i < N; i++) {
+    pos[i*3] = baseDir[i*3]*18; pos[i*3+1] = baseDir[i*3+1]*18; pos[i*3+2] = baseDir[i*3+2]*18;
+    vel[i*3] = vel[i*3+1] = vel[i*3+2] = 0;
+  }
+  ctrl.charge = 0; ctrl.scale = 1; ctrl.yaw = 0; ctrl.pitch = 0;
+  ctrl.posX = 0; ctrl.posY = 0; spin = 0;
+  toast('reset');
+});
+
+// =====================================================================
+//  CAMERA controller — webcam + MediaPipe hand tracking
+// =====================================================================
+const video = document.getElementById('cam');
+let handLandmarker = null;
+let camActive = false;
+
+camBtn.addEventListener('click', async () => {
+  if (camActive) {           // toggle off
+    stopCamera();
+    return;
+  }
+  camBtn.disabled = true;
+  setStatus(false, 'starting camera…');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: 'user' }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    video.classList.add('on');
+
+    if (!handLandmarker) {
+      toast('loading hand tracker…', 4000);
+      const { HandLandmarker, FilesetResolver } =
+        await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18');
+      const fileset = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm');
+      handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+          delegate: 'GPU',
+        },
+        runningMode: 'VIDEO',
+        numHands: 2,
+      });
+    }
+    camActive = true;
+    setSource('camera');
+    setStatus(true, 'camera live — show your hand');
+    toast('move your hand · pinch to charge · release to explode', 3200);
+  } catch (err) {
+    console.error(err);
+    setStatus(false, 'camera blocked');
+    toast('camera error: ' + (err.message || err));
+    video.classList.remove('on');
+  } finally {
+    camBtn.disabled = false;
+  }
+});
+
+function stopCamera() {
+  camActive = false;
+  video.classList.remove('on');
+  const s = video.srcObject;
+  if (s) s.getTracks().forEach((t) => t.stop());
+  video.srcObject = null;
+  if (source === 'camera') { setSource('demo'); setStatus(false, 'demo mode'); }
+}
+
+// --- hand → ctrl mapping ---------------------------------------------
+const PINCH_ON = 0.45, PINCH_OFF = 0.30;   // hysteresis on pinch strength
+let pinching = false, lastVidTs = -1;
+
+function lm(landmarks, i) { return landmarks[i]; }
+function dist3(a, b) {
+  const dx = a.x-b.x, dy = a.y-b.y, dz = (a.z||0)-(b.z||0);
+  return Math.hypot(dx, dy, dz);
+}
+
+function pollHands() {
+  // detectForVideo requires a strictly-increasing timestamp
+  const ts = video.currentTime * 1000;
+  if (ts === lastVidTs) return;
+  lastVidTs = ts;
+
+  let res;
+  try { res = handLandmarker.detectForVideo(video, performance.now()); }
+  catch { return; }
+  const hands = res && res.landmarks ? res.landmarks : [];
+
+  if (hands.length === 0) {
+    // hand lost: relax charge so a vanished hand doesn't stay charged forever
+    ctrl.charge *= 0.85;
+    return;
+  }
+
+  // primary hand drives rotation / position / pinch
+  const h = hands[0];
+  const wrist = lm(h, 0), midMcp = lm(h, 9), thumb = lm(h, 4), index = lm(h, 8);
+  // palm centre (mirror x to match the selfie-flipped video the user sees)
+  const palmX = 1 - midMcp.x, palmY = midMcp.y;
+  ctrl.posX = (palmX - 0.5) * 2.0;
+  ctrl.posY = -(palmY - 0.5) * 2.0;
+  // hand position also tilts the sphere
+  ctrl.yaw   = (palmX - 0.5) * 3.0;
+  ctrl.pitch = -(palmY - 0.5) * 1.6;
+
+  // pinch strength, normalised by hand size so distance to camera doesn't matter
+  const span = Math.max(1e-3, dist3(wrist, midMcp));
+  const pinchRaw = dist3(thumb, index) / span;
+  const pinchStrength = clamp(1 - (pinchRaw - 0.25) / 0.75, 0, 1);
+  ctrl.charge = pinchStrength;
+
+  if (!pinching && pinchStrength > PINCH_ON) pinching = true;
+  else if (pinching && pinchStrength < PINCH_OFF) {     // release = explode
+    pinching = false;
+    ctrl.explode = true;
+  }
+
+  // two hands → pinch-to-scale on the distance between palms
+  if (hands.length >= 2) {
+    const m2 = lm(hands[1], 9);
+    const d = Math.hypot((1 - m2.x) - palmX, m2.y - palmY);
+    ctrl.scale = clamp(d * 3.2, 0.5, 2.4);
+  }
+
+  ctrl.dist = -1; // not meaningful in camera mode
+}
+
+// =====================================================================
+//  SERIAL controller — STM32 board over Web Serial
+//  Stream: "roll,pitch,dist,temp,gesture\n" @115200 (lines with # ignored)
+// =====================================================================
+let serialPort = null;
+
+if (!('serial' in navigator)) {
+  serialBtn.disabled = true;
+  serialBtn.title = 'Web Serial needs Chrome/Edge';
+}
+
+serialBtn.addEventListener('click', async () => {
+  if (serialPort) { try { await serialPort.close(); } catch {} serialPort = null; return; }
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    serialPort = port;
+    if (camActive) stopCamera();
+    setSource('serial');
+    setStatus(true, 'board connected');
+    toast('tilt = rotate · hand over sensor = scale · shake = explode', 3200);
+    readSerial(port);
+  } catch {
+    setStatus(false, source === 'demo' ? 'demo mode' : statusText.textContent);
+  }
+});
+
+async function readSerial(port) {
+  const decoder = new TextDecoderStream();
+  port.readable.pipeTo(decoder.writable).catch(() => {});
+  const reader = decoder.readable.getReader();
+  let buf = '';
+  while (true) {
+    let res;
+    try { res = await reader.read(); } catch { break; }
+    if (res.done) break;
+    buf += res.value;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line || line[0] === '#') continue;
+      const p = line.split(',');
+      if (p.length < 5) continue;
+      const roll = +p[0], pitch = +p[1], d = +p[2], temp = +p[3], g = +p[4];
+      if (Number.isFinite(roll))  { ctrl.roll = roll; ctrl.yaw   = roll * Math.PI/180 * 1.1; }
+      if (Number.isFinite(pitch)) { ctrl.pitch = pitch * Math.PI/180 * 1.1; }
+      if (Number.isFinite(d)) {
+        ctrl.dist = d;
+        if (d >= 0) {
+          // close hand = gather/charge + shrink; far = spread
+          const norm = clamp((d - 4) / 36, 0, 1);
+          ctrl.scale  = 0.6 + norm * 1.6;
+          ctrl.charge = 1 - norm;
+        } else { ctrl.charge = 0; }
+      }
+      if (Number.isFinite(temp)) ctrl.temp = temp;
+      if (g === 1) ctrl.explode = true;
+      ctrl.posX = ctrl.posY = 0;   // board mode keeps the sphere centred
+    }
+  }
+  serialPort = null;
+  if (source === 'serial') { setSource('demo'); setStatus(false, 'board disconnected'); }
+}
+</script>
+</body>
+</html>
